@@ -157,7 +157,8 @@ def compute_model_dhdt(ds, model_years, model_thickness_var="h"):
     # --------------------------------------------------
     # Convert to numpy
     # --------------------------------------------------
-    t = model_years.astype(float)
+    # t = model_years.astype(float)
+    t = np.asarray(model_years, dtype=np.float64)
 
     # --------------------------------------------------
     # Compute time differences
@@ -170,7 +171,8 @@ def compute_model_dhdt(ds, model_years, model_thickness_var="h"):
     # --------------------------------------------------
     # Compute midpoint times safely
     # --------------------------------------------------
-    tmid = t[:-1] + dt / 2.0
+    # tmid = t[:-1] + dt / 2.0
+    tmid = 0.5 * (t[:-1] + t[1:])
 
     # --------------------------------------------------
     # Compute dh/dt
@@ -387,7 +389,8 @@ def load_obs_velocity_yearly(
     
     return VX, VY, VX_ERR, VY_ERR, years
 
-
+    
+    
 # ==============================================================================
 # COMBINED DATA FLATTENING
 # ==============================================================================
@@ -522,12 +525,12 @@ def flatten_and_mask_combined(
 
 def load_and_prepare_data():
     # ----------------------- PATHS -----------------------
-    OBS_THICKNESS_DIR = "/Users/sp53972/Library/CloudStorage/Box-Box/Main/Projects/Modern Data Model Scoring to SLR/761_obs/761 elev"
+    OBS_THICKNESS_DIR = "/Users/sp53972/Library/CloudStorage/Box-Box/Main/Projects/Modern Data Model Scoring to SLR/inputs/761_obs/761 elev"
     THICKNESS_PATTERN = "elev_antarctica_elevation_*.nc"
     OBS_THICKNESS_VAR = "height"
     OBS_THICKNESS_RMSE_VAR = "absolute_elevation_rmse"
 
-    OBS_VELOCITY_DIR = "/Users/sp53972/Library/CloudStorage/Box-Box/Main/Projects/Modern Data Model Scoring to SLR/761_obs/761 veloc"
+    OBS_VELOCITY_DIR = "/Users/sp53972/Library/CloudStorage/Box-Box/Main/Projects/Modern Data Model Scoring to SLR/inputs/761_obs/761 veloc"
     VELOCITY_PATTERN = "vel_Antarctica_ice_velocity_*.nc"
     OBS_VX_VAR = "VX"
     OBS_VY_VAR = "VY"
@@ -543,9 +546,9 @@ def load_and_prepare_data():
     )
 
     MODEL_PATHS = [
-        '/Users/sp53972/Library/CloudStorage/Box-Box/Main/Projects/Modern Data Model Scoring to SLR/ch1_ensemble/run1_regridded.nc',
-        '/Users/sp53972/Library/CloudStorage/Box-Box/Main/Projects/Modern Data Model Scoring to SLR/ch1_ensemble/run2_regridded.nc',
-        '/Users/sp53972/Library/CloudStorage/Box-Box/Main/Projects/Modern Data Model Scoring to SLR/ch1_ensemble/run9_regridded.nc',
+        '/Users/sp53972/Library/CloudStorage/Box-Box/Main/Projects/Modern Data Model Scoring to SLR/inputs/ch1_ensemble/run1_regridded.nc',
+        '/Users/sp53972/Library/CloudStorage/Box-Box/Main/Projects/Modern Data Model Scoring to SLR/inputs/ch1_ensemble/run2_regridded.nc',
+        '/Users/sp53972/Library/CloudStorage/Box-Box/Main/Projects/Modern Data Model Scoring to SLR/inputs/ch1_ensemble/run9_regridded.nc',
     ]
     MODEL_THICKNESS_VAR = "h"
     MODEL_VX_VAR = "ua"
@@ -740,6 +743,8 @@ def prepare_for_inference(data_dict):
     #     "n_vel": n_vel,
     # } this is a temporary change to make it run faster
     
+
+        
     # --------------------------------------------------
 # RANDOM SUBSAMPLING FOR MCMC SPEED
 # --------------------------------------------------
@@ -804,8 +809,8 @@ def build_model_proposal(data):
     N = float(y.size)
 
     with pm.Model() as model:
-
-        sigma_base_thick = pm.HalfNormal("sigma_base_thick", sigma=30.0)
+        sigma_base_thick = pm.HalfNormal("sigma_base_thick", sigma=2.0) #tighter prior on uncertainty 
+        #sigma_base_thick = pm.HalfNormal("sigma_base_thick", sigma=30.0) #really wide prior on model uncertainty
         beta_thick       = pm.HalfNormal("beta_thick", sigma=0.5)
         sigma_base_vel   = pm.HalfNormal("sigma_base_vel", sigma=20.0)
         beta_vel         = pm.HalfNormal("beta_vel", sigma=0.5)
@@ -869,25 +874,31 @@ def run_mcmc(model, draws=500, tune=1000, chains=4, target_accept=0.95):
     return trace
 
 
+
 def compute_model_weights(trace, data):
-    """Compute weights from scaled log-likelihoods."""
+    """Compute weights from scaled log-likelihoods using the same sigma_model form as the Bayesian model."""
     y = data["y_obs"]
     sig_obs = data["sigma_obs"]
     F = data["F"]
+    speed = data["speed"]
     M = data["M"]
     n_dhdt = data["n_dhdt"]
 
     N = float(y.size)
 
     post = trace.posterior
-    sigma_thickness = float(post["sigma_base_thick"].mean(dim=("chain", "draw")).values)
-    sigma_velocity  = float(post["sigma_base_vel"].mean(dim=("chain", "draw")).values)
 
-    sigma_model = np.where(
-        np.arange(y.size) < n_dhdt,
-        sigma_thickness,
-        sigma_velocity
-    )
+    sigma_base_thick = float(post["sigma_base_thick"].mean(dim=("chain", "draw")).values)
+    beta_thick       = float(post["beta_thick"].mean(dim=("chain", "draw")).values)
+    sigma_base_vel   = float(post["sigma_base_vel"].mean(dim=("chain", "draw")).values)
+    beta_vel         = float(post["beta_vel"].mean(dim=("chain", "draw")).values)
+
+    is_thick = np.arange(y.size) < n_dhdt
+
+    sigma_model = np.empty_like(y, dtype=float)
+    sigma_model[is_thick] = sigma_base_thick * np.sqrt(1.0 + beta_thick * speed[is_thick])
+    sigma_model[~is_thick] = sigma_base_vel * np.sqrt(1.0 + beta_vel * speed[~is_thick])
+
     sigma_tot = np.sqrt(sig_obs**2 + sigma_model**2)
 
     loglik = np.zeros(M, dtype=float)
@@ -895,22 +906,19 @@ def compute_model_weights(trace, data):
         r = y - F[m, :]
         loglik[m] = -0.5 * np.sum((r**2 / sigma_tot**2) + np.log(2.0 * np.pi * sigma_tot**2))
 
-    # scale by number of observations
     loglik_scaled = loglik / N
 
     w = np.exp(loglik_scaled - loglik_scaled.max())
     w = w / w.sum()
 
     return w, loglik_scaled
-
-
 # ==============================================================================
 # MAIN
 # ==============================================================================
 
 def main():
     print("=" * 70)
-    print("HIERARCHICAL BAYESIAN MODEL - THICKNESS + VELOCITY")
+    print("BAYESIAN MODEL - THICKNESS + VELOCITY")
     print("=" * 70)
 
     raw = load_and_prepare_data()
@@ -947,8 +955,8 @@ def main():
     return trace, weights, data, raw
 
 
-if __name__ == "__main__":
-    trace, weights, data, raw = main()
+# if __name__ == "__main__":
+#     trace, weights, data, raw = main()
     
     
     
@@ -967,6 +975,353 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import numpy as np
 
+    #sanity check plots for obs data coverage on the model
+    # ==============================================================================
+# PIXEL COVERAGE MAPS (WHERE THE MODEL IS BEING EVALUATED)
+# ==============================================================================
+
+def plot_pixel_coverage(raw):
+        """
+        Plot which pixels are used in the likelihood after masking.
+        Shows spatial coverage of:
+            1) dh/dt pixels
+            2) velocity pixels for each year
+        """
+    
+        obs_dhdt = raw["obs_dhdt"]
+        VX_obs = raw["VX_obs"]
+        VY_obs = raw["VY_obs"]
+        VX_ERR = raw["VX_ERR_obs"]
+        VY_ERR = raw["VY_ERR_obs"]
+        obs_vel_years = raw["obs_vel_years"]
+    
+        M = raw["M"]
+    
+        print("\nGenerating pixel coverage maps...")
+    
+       
+        # ==========================================================
+        # THICKNESS COVERAGE BY YEAR
+        # ==========================================================
+
+        obs_dhdt = raw["obs_dhdt"]
+        
+        years = obs_dhdt.time.values
+
+        # keep only times with real elevation observations
+        valid_times = np.isfinite(obs_dhdt.mean(dim=("y","x"), skipna=True))
+        years = obs_dhdt.time.values[valid_times]
+        n_years = len(years)
+        
+        cols = min(4, n_years)
+        rows = int(np.ceil(n_years / cols))
+        
+        fig, axes = plt.subplots(rows, cols, figsize=(4*cols,4*rows))
+        axes = np.atleast_1d(axes).flatten()
+        
+        for i, t in enumerate(years):
+        
+            dh = obs_dhdt.sel(time=t).values
+        
+            mask = np.isfinite(dh)
+        
+            axes[i].imshow(mask, origin="lower", cmap="viridis")
+        
+            axes[i].set_title(f"Thickness Pixels Used\n{float(t):.1f}")
+            axes[i].axis("off")
+        
+        for j in range(i+1, len(axes)):
+            axes[j].axis("off")
+        
+        plt.suptitle("Thickness Observation Coverage by Time Step")
+        plt.tight_layout()
+        
+        plt.savefig("pixel_coverage_thickness_by_year.png", dpi=300)
+        
+        print("✓ Saved pixel_coverage_thickness_by_year.png")
+        
+        plt.show()
+    
+        # ==========================================================
+        # VELOCITY COVERAGE BY YEAR
+        # ==========================================================
+    
+        valid_years = []
+    
+        for year in obs_vel_years:
+    
+            if year not in VX_obs:
+                continue
+    
+            # Check model availability
+            skip = False
+            for m in range(M):
+                if raw["vx_models"][m][year] is None:
+                    skip = True
+                    break
+    
+            if skip:
+                continue
+    
+            valid_years.append(year)
+    
+        if len(valid_years) == 0:
+            print("No valid velocity years")
+            return
+    
+        n = len(valid_years)
+    
+        cols = min(4, n)
+        rows = int(np.ceil(n / cols))
+    
+        fig, axes = plt.subplots(rows, cols, figsize=(4*cols,4*rows))
+        axes = np.atleast_1d(axes).flatten()
+    
+        for i, year in enumerate(valid_years):
+    
+            vx = VX_obs[year]
+            vy = VY_obs[year]
+            vx_err = VX_ERR[year]
+            vy_err = VY_ERR[year]
+    
+            mask = (
+                np.isfinite(vx) &
+                np.isfinite(vy) &
+                np.isfinite(vx_err) &
+                np.isfinite(vy_err)
+            )
+    
+            ax = axes[i]
+            im = ax.imshow(mask, origin="lower", cmap="viridis")
+    
+            ax.set_title(f"Velocity Pixels Used\n{year}")
+            ax.axis("off")
+    
+        for j in range(i+1, len(axes)):
+            axes[j].axis("off")
+    
+        fig.colorbar(im, ax=axes.tolist(), shrink=0.7, label="Used Pixel (1=True)")
+    
+        plt.suptitle("Pixels Used for Velocity Likelihood")
+        plt.tight_layout()
+    
+        plt.savefig("pixel_coverage_velocity.png", dpi=300)
+    
+        print("✓ Saved pixel_coverage_velocity.png")
+    
+        plt.show()
+        
+# ==============================================================================
+# FATAL PIXEL MAPS (LIKELIHOOD OUTLIERS FOR dh/dt)
+# ==============================================================================
+
+def create_fatal_pixel_maps(raw, trace):
+    """
+    Fatal-pixel map for dh/dt using the same uncertainty model
+    as the Bayesian likelihood.
+
+    For dh/dt in the current HBM:
+        sigma_model_thick = sigma_base_thick
+    because speed_dhdt = 0 in prepare_for_inference().
+    """
+
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+
+    M = raw["M"]
+
+    post = trace.posterior
+    sigma_base_thick = float(post["sigma_base_thick"].mean(dim=("chain", "draw")).values)
+
+    print("\n" + "=" * 70)
+    print("FATAL PIXEL MAPS (dh/dt)")
+    print("=" * 70)
+    print(f"sigma_base_thick = {sigma_base_thick:.3f}")
+
+    obs_all = raw["obs_dhdt"]
+    obs_unc_all = raw["obs_unc"]
+
+    # Fill missing obs uncertainty with median finite value
+    unc_vals = obs_unc_all.values
+    finite_unc = np.isfinite(unc_vals)
+    fill_unc = float(np.nanmedian(unc_vals[finite_unc])) if np.any(finite_unc) else 20.0
+    obs_unc_all = obs_unc_all.where(np.isfinite(obs_unc_all), other=fill_unc)
+
+    fig, axes = plt.subplots(1, M, figsize=(6 * M, 5), constrained_layout=True)
+    if M == 1:
+        axes = [axes]
+
+    cmap = mcolors.ListedColormap(["black", "orange", "red"])
+    norm = mcolors.BoundaryNorm([0, 1, 2, 3], cmap.N)
+
+    print("\nFATAL PIXEL STATISTICS")
+    print("-" * 70)
+
+    for i in range(M):
+        model_all = raw["ensemble_dhdt"][i]
+
+        # Track worst mismatch across time at each pixel
+        max_abs_z = np.full(obs_all.isel(time=0).shape, np.nan)
+
+        for t in obs_all.time.values:
+            obs = obs_all.sel(time=t).values
+            obs_unc = obs_unc_all.sel(time=t).values
+            model = model_all.sel(time=t).values
+
+            sigma_tot = np.sqrt(obs_unc**2 + sigma_base_thick**2)
+
+            valid = np.isfinite(obs) & np.isfinite(model) & np.isfinite(sigma_tot) & (sigma_tot > 0)
+            z = np.full(obs.shape, np.nan)
+            z[valid] = (obs[valid] - model[valid]) / sigma_tot[valid]
+
+            if np.all(~valid):
+                continue
+
+            if np.all(np.isnan(max_abs_z)):
+                max_abs_z = np.abs(z)
+            else:
+                max_abs_z = np.fmax(max_abs_z, np.abs(z))
+
+        valid = np.isfinite(max_abs_z)
+
+        fatal = np.full(max_abs_z.shape, np.nan)
+        fatal[valid] = 0
+        fatal[valid & (max_abs_z > 2)] = 1
+        fatal[valid & (max_abs_z > 3)] = 2
+
+        n_valid = int(np.sum(valid))
+        n_bad = int(np.sum(valid & (max_abs_z > 2)))
+        n_fatal = int(np.sum(valid & (max_abs_z > 3)))
+
+        print(f"Model {i+1}: valid={n_valid:,}, |z|>2={n_bad:,}, |z|>3={n_fatal:,}")
+
+        im = axes[i].imshow(fatal, cmap=cmap, norm=norm, origin="lower")
+        axes[i].set_title(
+            f"Model {i+1}\n|z|>2: {n_bad:,}\n|z|>3: {n_fatal:,}",
+            fontsize=11
+        )
+        axes[i].axis("off")
+
+    fig.colorbar(
+        im,
+        ax=axes,
+        shrink=0.65,
+        label="0 = OK   |   1 = 2 < |z| ≤ 3   |   2 = |z| > 3"
+    )
+
+    plt.suptitle("Fatal Pixels for dh/dt Likelihood", fontsize=14)
+    plt.savefig("fatal_pixels_dhdt.png", dpi=300, bbox_inches="tight")
+    plt.show()
+
+    print("✓ Saved: fatal_pixels_dhdt.png")
+
+def make_dhdt_diagnostic_figure(raw, trace, model_index=0):
+
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+
+    print("\nGenerating dh/dt diagnostic figure...")
+
+    # ------------------------------------
+    # posterior parameters
+    # ------------------------------------
+
+    post = trace.posterior
+    sigma_base = float(post["sigma_base_thick"].mean(dim=("chain","draw")).values)
+
+    # ------------------------------------
+    # average fields
+    # ------------------------------------
+
+    # obs = raw["obs_dhdt"].mean(dim="time", skipna=True).values
+    # model = raw["ensemble_dhdt"][model_index].mean(dim="time", skipna=True).values
+    # obs_unc = raw["obs_unc"].mean(dim="time", skipna=True).values
+    obs = np.nanmean(raw["obs_dhdt"].values, axis=0)
+    model = np.nanmean(raw["ensemble_dhdt"][model_index].values, axis=0)
+    obs_unc = np.nanmean(raw["obs_unc"].values, axis=0)
+    # ------------------------------------
+    # residuals
+    # ------------------------------------
+
+    residual = obs - model
+
+    # ------------------------------------
+    # sigma_total
+    # ------------------------------------
+
+    sigma_tot = np.sqrt(obs_unc**2 + sigma_base**2)
+
+    # ------------------------------------
+    # z score
+    # ------------------------------------
+
+    z = residual / sigma_tot
+
+    # ------------------------------------
+    # fatal pixel classification
+    # ------------------------------------
+
+    # fatal = np.zeros_like(z)
+
+    # fatal[np.abs(z) > 2] = 1
+    # fatal[np.abs(z) > 3] = 2
+    fatal = np.full_like(z, np.nan)
+
+    fatal[(np.abs(z) <= 2)] = 0
+    fatal[(np.abs(z) > 2)] = 1
+    fatal[(np.abs(z) > 3)] = 2
+
+    # ------------------------------------
+    # plotting
+    # ------------------------------------
+
+    fig, ax = plt.subplots(2,2, figsize=(12,10))
+
+    # observed
+    im0 = ax[0,0].imshow(obs, cmap="RdBu_r", vmin=-3, vmax=3)
+    ax[0,0].set_title("Observed dh/dt (m/yr)")
+    ax[0,0].axis("off")
+
+    # model
+    im1 = ax[0,1].imshow(model, cmap="RdBu_r", vmin=-3, vmax=3)
+    ax[0,1].set_title(f"Model dh/dt (Model {model_index+1})")
+    ax[0,1].axis("off")
+
+    # residual
+    im2 = ax[1,0].imshow(residual, cmap="RdBu_r", vmin=-2, vmax=2)
+    ax[1,0].set_title("Residual (Obs − Model)")
+    ax[1,0].axis("off")
+
+    # fatal pixels
+    cmap = mcolors.ListedColormap(["black","orange","red"])
+    norm = mcolors.BoundaryNorm([0,1,2,3], cmap.N)
+
+    im3 = ax[1,1].imshow(fatal, cmap=cmap, norm=norm)
+    ax[1,1].set_title("Fatal Pixels (Likelihood)")
+    ax[1,1].axis("off")
+
+    # colorbars
+    fig.colorbar(im0, ax=ax[0,0], fraction=0.046)
+    fig.colorbar(im1, ax=ax[0,1], fraction=0.046)
+    fig.colorbar(im2, ax=ax[1,0], fraction=0.046)
+
+    cbar = fig.colorbar(im3, ax=ax[1,1], fraction=0.046)
+    cbar.set_label("0 = OK | 1 = |z|>2 | 2 = |z|>3")
+
+    plt.suptitle("Antarctic Ice Thickness Change Model Evaluation", fontsize=16)
+
+    plt.tight_layout()
+
+    plt.savefig("dhdt_model_diagnostics.png", dpi=300)
+
+    print("✓ Saved: dhdt_model_diagnostics.png")
+
+    plt.show()
+
+
+#residual maps================================================================
 def create_residual_maps(raw, weights):
     """
     Create residual maps for thickness (dh/dt) and velocity (vx, vy) 
@@ -993,7 +1348,7 @@ def create_residual_maps(raw, weights):
         axes = [axes]
     
     # Color normalization for dh/dt residuals
-    norm_dhdt = mcolors.TwoSlopeNorm(vcenter=0, vmin=-10, vmax=10)
+    norm_dhdt = mcolors.TwoSlopeNorm(vcenter=0, vmin=-5, vmax=5)
     
     print("="*70)
     print("THICKNESS CHANGE (dh/dt) RESIDUAL STATISTICS")
@@ -1194,8 +1549,24 @@ def create_residual_maps(raw, weights):
 # RUN THE RESIDUAL ANALYSIS
 # ==============================================================================
 
-if __name__ == "__main__":
-    # After running main() and getting results
-    # trace, weights, data, raw = main()
+# if __name__ == "__main__":
+#     # After running main() and getting results
+#     # trace, weights, data, raw = main()
     
+#     create_residual_maps(raw, weights)
+if __name__ == "__main__":
+
+    trace, weights, data, raw = main()
+
     create_residual_maps(raw, weights)
+
+    plot_pixel_coverage(raw)
+
+    create_fatal_pixel_maps(raw, trace)
+
+
+    for i in range(raw["M"]):
+        make_dhdt_diagnostic_figure(raw, trace, model_index=i)
+    
+    
+#fatal pixels
