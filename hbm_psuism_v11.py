@@ -51,24 +51,52 @@ def _parse_origin_allow_day00(unit_str: str) -> datetime:
 
     return datetime(Y, Mo, D, hh, mm, ss)
 
-
 def model_decimal_years_from_ds(ds, time_name="time"):
     """
     Convert model time values to decimal years.
     Works for:
         1) seconds since YYYY-MM-DD
         2) already-year values (e.g. 2000, 2001, ...)
+    Also cleans NetCDF fill values in time.
     """
 
-    t = np.asarray(ds[time_name].values, dtype=float)
+    time_var = ds[time_name]
+    t = np.asarray(time_var.values, dtype=float)
+
+    # ----------------------------------------------
+    # Clean obvious NetCDF fill / missing values
+    # ----------------------------------------------
+    fill_value = time_var.attrs.get("_FillValue", None)
+    missing_value = time_var.attrs.get("missing_value", None)
+
+    if fill_value is not None:
+        t[t == fill_value] = np.nan
+    if missing_value is not None:
+        t[t == missing_value] = np.nan
+
+    # also catch absurd placeholder values
+    t[np.abs(t) > 1e20] = np.nan
+
+    # ----------------------------------------------
+    # Drop bad time entries
+    # ----------------------------------------------
+    good = np.isfinite(t)
+
+    if not np.any(good):
+        raise ValueError("No valid time values found in model time variable")
+
+    if np.sum(~good) > 0:
+        print(f"Warning: removed {np.sum(~good)} invalid time value(s) from {time_name}")
+
+    t = t[good]
 
     # Try to read units
-    unit_str = ds[time_name].attrs.get("units", None)
+    unit_str = time_var.attrs.get("units", None)
     if unit_str is None:
-        unit_str = ds[time_name].attrs.get("unit", None)
+        unit_str = time_var.attrs.get("unit", None)
 
     # --------------------------------------------------
-    # CASE 1 — already years (your regridded files)
+    # CASE 1 — already years
     # --------------------------------------------------
     if unit_str is None:
         print("Time variable has no units — assuming values are already years.")
@@ -78,18 +106,14 @@ def model_decimal_years_from_ds(ds, time_name="time"):
     # CASE 2 — seconds since origin
     # --------------------------------------------------
     if "since" in unit_str and "second" in unit_str:
-
         origin = _parse_origin_allow_day00(unit_str)
 
         years = np.empty_like(t, dtype=float)
 
         for i, sec in enumerate(t):
-
             dt = origin + timedelta(seconds=float(sec))
-
             year_start = datetime(dt.year, 1, 1)
             frac = (dt - year_start).total_seconds() / SEC_PER_YEAR
-
             years[i] = dt.year + frac
 
         return years
@@ -99,6 +123,62 @@ def model_decimal_years_from_ds(ds, time_name="time"):
     # --------------------------------------------------
     print("Time units not recognized — assuming values are years.")
     return t
+
+
+# def model_decimal_years_from_ds(ds, time_name="time"):
+#     """
+#     Convert model time values to decimal years.
+#     Works for:
+#         1) seconds since YYYY-MM-DD
+#         2) already-year values (e.g. 2000, 2001, ...)
+#     """
+
+#     t = np.asarray(ds[time_name].values, dtype=float)
+    
+#     ##this is here cuz psu ism has a weird 2nd timestep thats messed up
+#     if not np.all(np.isfinite(t)):
+#         raise ValueError("Non-finite values found in model_years")
+
+#     if np.any(np.abs(t) > 3000):
+#         raise ValueError(f"Unrealistic year values found in model_years: min={np.nanmin(t)}, max={np.nanmax(t)}")
+
+#     # Try to read units
+#     unit_str = ds[time_name].attrs.get("units", None)
+#     if unit_str is None:
+#         unit_str = ds[time_name].attrs.get("unit", None)
+
+#     # --------------------------------------------------
+#     # CASE 1 — already years (your regridded files)
+#     # --------------------------------------------------
+#     if unit_str is None:
+#         print("Time variable has no units — assuming values are already years.")
+#         return t
+
+#     # --------------------------------------------------
+#     # CASE 2 — seconds since origin
+#     # --------------------------------------------------
+#     if "since" in unit_str and "second" in unit_str:
+
+#         origin = _parse_origin_allow_day00(unit_str)
+
+#         years = np.empty_like(t, dtype=float)
+
+#         for i, sec in enumerate(t):
+
+#             dt = origin + timedelta(seconds=float(sec))
+
+#             year_start = datetime(dt.year, 1, 1)
+#             frac = (dt - year_start).total_seconds() / SEC_PER_YEAR
+
+#             years[i] = dt.year + frac
+
+#         return years
+
+#     # --------------------------------------------------
+#     # CASE 3 — already numeric years with units
+#     # --------------------------------------------------
+#     print("Time units not recognized — assuming values are years.")
+#     return t
 
 
 def _to_2d(arr, name, fname):
@@ -117,11 +197,40 @@ def _extract_year_from_filename(fname: str) -> int:
     return int(m.group(1))
 
 
-def _snap_model_year_to_obs_year(t_model: float, available_years: np.ndarray) -> int | None:
-    """Map a model decimal year to the nearest available obs integer year."""
-    y = int(np.rint(t_model))
-    if y in set(available_years.tolist()):
-        return y
+# def _snap_model_year_to_obs_year(t_model: float, available_years: np.ndarray) -> int | None:
+#     """Map a model decimal year to the nearest available obs integer year."""
+#     y = int(np.rint(t_model))
+#     if y in set(available_years.tolist()):
+#         return y
+#     return None
+
+def _snap_model_year_to_obs_year(t_model, available_years, tol=1.5):
+    """
+    Match model decimal year to nearest observation year.
+
+    Parameters
+    ----------
+    t_model : float
+        model time (decimal year)
+
+    available_years : array
+        integer observation years
+
+    tol : float
+        maximum allowed difference (years)
+
+    Returns
+    -------
+    int or None
+    """
+
+    available_years = np.asarray(available_years)
+
+    idx = np.argmin(np.abs(available_years - t_model))
+
+    if np.abs(available_years[idx] - t_model) <= tol:
+        return int(available_years[idx])
+
     return None
 
 
@@ -289,42 +398,94 @@ def compute_obs_dhdt_on_model_intervals(
 # VELOCITY PROCESSING
 # ==============================================================================
 
-def compute_model_velocity_on_obs_years(
-    ds, 
-    model_years,
-    obs_years,
-    vx_var="uvelmean",
-    vy_var="vvelmean"
-):
+# def compute_model_velocity_on_obs_years(
+#     ds, 
+#     model_years,
+#     obs_years,
+#     vx_var="uvelmean",
+#     vy_var="vvelmean"
+# ):
+#     """
+#     Extract model velocity at specific obs years by finding nearest model time.
+#     Returns list of (vx, vy) arrays for each obs year.
+#     """
+#     vx = ds[vx_var].astype("float32")
+#     vy = ds[vy_var].astype("float32")
+    
+#     vx = vx.assign_coords(time=("time", model_years))
+#     vy = vy.assign_coords(time=("time", model_years))
+    
+#     vx_list = []
+#     vy_list = []
+    
+#     print("\nExtracting model velocity at obs years:")
+#     for obs_year in obs_years:
+#         # Find nearest model time
+#         idx = np.argmin(np.abs(model_years - obs_year))
+#         nearest_year = model_years[idx]
+        
+#         if abs(nearest_year - obs_year) > 1.0:  # tolerance of 1 year
+#             print(f"  Warning: obs year {obs_year} -> nearest model {nearest_year:.2f} (diff > 1yr)")
+#             vx_list.append(None)
+#             vy_list.append(None)
+#         else:
+#             print(f"  obs year {obs_year} -> model time {nearest_year:.2f}")
+#             vx_list.append(vx.isel(time=idx).values)
+#             vy_list.append(vy.isel(time=idx).values)
+    
+#     return vx_list, vy_list
+
+def compute_model_velocity_change(ds, model_years, vx_var="ua", vy_var="va"):
     """
-    Extract model velocity at specific obs years by finding nearest model time.
-    Returns list of (vx, vy) arrays for each obs year.
+    Compute model velocity change rates (dvx/dt, dvy/dt)
+    between model time steps.
     """
+
     vx = ds[vx_var].astype("float32")
     vy = ds[vy_var].astype("float32")
-    
+
+    # ensure time increasing
+    order = np.argsort(model_years)
+    model_years = np.asarray(model_years)[order]
+
+    vx = vx.isel(time=order)
+    vy = vy.isel(time=order)
+
     vx = vx.assign_coords(time=("time", model_years))
     vy = vy.assign_coords(time=("time", model_years))
-    
-    vx_list = []
-    vy_list = []
-    
-    print("\nExtracting model velocity at obs years:")
-    for obs_year in obs_years:
-        # Find nearest model time
-        idx = np.argmin(np.abs(model_years - obs_year))
-        nearest_year = model_years[idx]
-        
-        if abs(nearest_year - obs_year) > 1.0:  # tolerance of 1 year
-            print(f"  Warning: obs year {obs_year} -> nearest model {nearest_year:.2f} (diff > 1yr)")
-            vx_list.append(None)
-            vy_list.append(None)
-        else:
-            print(f"  obs year {obs_year} -> model time {nearest_year:.2f}")
-            vx_list.append(vx.isel(time=idx).values)
-            vy_list.append(vy.isel(time=idx).values)
-    
-    return vx_list, vy_list
+
+    t = np.asarray(model_years, dtype=float)
+    dt = np.diff(t)
+
+    if np.any(dt == 0):
+        raise ValueError("Duplicate velocity time values detected")
+
+    tmid = 0.5 * (t[:-1] + t[1:])
+
+    vx0 = vx.isel(time=slice(0, -1)).values
+    vx1 = vx.isel(time=slice(1, None)).values
+
+    vy0 = vy.isel(time=slice(0, -1)).values
+    vy1 = vy.isel(time=slice(1, None)).values
+
+    dvxdt = (vx1 - vx0) / dt[:, None, None]
+    dvydt = (vy1 - vy0) / dt[:, None, None]
+
+    dvxdt = xr.DataArray(
+        dvxdt.astype("float32"),
+        dims=["time","y","x"],
+        coords={"time": tmid},
+        attrs={"units":"m/yr²"}
+    )
+
+    dvydt = xr.DataArray(
+        dvydt.astype("float32"),
+        dims=["time","y","x"],
+        coords={"time": tmid},
+        attrs={"units":"m/yr²"}
+    )
+
+    return dvxdt, dvydt
 
 
 def load_obs_velocity_yearly(
@@ -389,141 +550,664 @@ def load_obs_velocity_yearly(
     
     return VX, VY, VX_ERR, VY_ERR, years
 
+
+def compute_obs_dvdt_on_model_intervals(
+    VX,
+    VY,
+    VX_ERR,
+    VY_ERR,
+    obs_years,
+    model_t,
+    model_tmid,
+    model_dt,
+):
+    """
+    Compute observed velocity change rates (dvx/dt, dvy/dt)
+    using the same time intervals as the model.
+
+    Uncertainty propagation:
+        σ_dv/dt = sqrt(σ1² + σ2²) / dt
+    """
+
+    dvx_list = []
+    dvy_list = []
+    uncx_list = []
+    uncy_list = []
+
+    used = 0
+
+    print("\nComputing OBS dv/dt on MODEL intervals:")
+
+    for i in range(len(model_t) - 1):
+
+        y1 = _snap_model_year_to_obs_year(model_t[i], obs_years)
+        y2 = _snap_model_year_to_obs_year(model_t[i+1], obs_years)
+
+        if (y1 is None) or (y2 is None):
+            shape = next(iter(VX.values())).shape
+
+            dvx_list.append(np.full(shape, np.nan, dtype="float32"))
+            dvy_list.append(np.full(shape, np.nan, dtype="float32"))
+
+            uncx_list.append(np.full(shape, np.nan, dtype="float32"))
+            uncy_list.append(np.full(shape, np.nan, dtype="float32"))
+
+            continue
+
+        dt = float(model_dt[i])
+
+        vx1 = VX[y1]
+        vx2 = VX[y2]
+
+        vy1 = VY[y1]
+        vy2 = VY[y2]
+
+        errx1 = VX_ERR[y1]
+        errx2 = VX_ERR[y2]
+
+        erry1 = VY_ERR[y1]
+        erry2 = VY_ERR[y2]
+
+        dvx = (vx2 - vx1) / dt
+        dvy = (vy2 - vy1) / dt
+
+        uncx = np.sqrt(errx1**2 + errx2**2) / dt
+        uncy = np.sqrt(erry1**2 + erry2**2) / dt
+
+        dvx_list.append(dvx.astype("float32"))
+        dvy_list.append(dvy.astype("float32"))
+
+        uncx_list.append(uncx.astype("float32"))
+        uncy_list.append(uncy.astype("float32"))
+
+        used += 1
+
+    obs_dvxdt = xr.DataArray(
+        np.stack(dvx_list),
+        dims=["time","y","x"],
+        coords={"time":model_tmid},
+        attrs={"units":"m/yr²"}
+    )
+
+    obs_dvydt = xr.DataArray(
+        np.stack(dvy_list),
+        dims=["time","y","x"],
+        coords={"time":model_tmid},
+        attrs={"units":"m/yr²"}
+    )
+
+    obs_uncx = xr.DataArray(
+        np.stack(uncx_list),
+        dims=["time","y","x"],
+        coords={"time":model_tmid},
+        attrs={"units":"m/yr²"}
+    )
+
+    obs_uncy = xr.DataArray(
+        np.stack(uncy_list),
+        dims=["time","y","x"],
+        coords={"time":model_tmid},
+        attrs={"units":"m/yr²"}
+    )
+
+    print(f"✓ Built obs dv/dt. Non-missing intervals: {used}/{len(model_dt)}")
+
+    return obs_dvxdt, obs_dvydt, obs_uncx, obs_uncy
     
     
 # ==============================================================================
 # COMBINED DATA FLATTENING
 # ==============================================================================
-
 def flatten_and_mask_combined(
     dhdt_obs, dhdt_sigma, dhdt_models,
-    vx_obs_dict, vy_obs_dict, 
-    vx_err_dict, vy_err_dict,
-    vx_models_dict, vy_models_dict,
-    obs_vel_years,
+    dvxdt_obs, dvydt_obs,
+    dvxdt_unc, dvydt_unc,
+    dvxdt_models, dvydt_models,
+    VX_obs_dict=None, VY_obs_dict=None, obs_vel_years=None,
 ):
     """
-    Flatten and combine thickness change and velocity data.
-    Now uses actual ERRORX/ERRORY from observations.
+    Flatten and combine thickness change (dh/dt) and velocity change (dv/dt) data.
+    Also builds a speed vector using the EXACT SAME masking/order as the likelihood.
+    THIS IS MASKING OBS UNC B/C IT IS HUGEEE lol.
     """
-    M = len(dhdt_models)
     
-    # --- THICKNESS CHANGE ---
+    THICK_UNC_THRESHOLD = 50.0
+    VEL_UNC_THRESHOLD   = 10.0
+    
+    M = len(dhdt_models)
+
+    # ==========================================================
+    # THICKNESS CHANGE (dh/dt)
+    # ==========================================================
+
     y_dhdt = dhdt_obs.values.reshape(-1)
     sig_dhdt = dhdt_sigma.values.reshape(-1)
     F_dhdt = np.stack([m.values.reshape(-1) for m in dhdt_models], axis=0)
-    
-    mask_dhdt = np.isfinite(y_dhdt) & np.isfinite(sig_dhdt)
+
+    # mask_dhdt = np.isfinite(y_dhdt) & np.isfinite(sig_dhdt) #this needs to be filtered due to large unc
+    mask_dhdt = (
+    np.isfinite(y_dhdt) &
+    np.isfinite(sig_dhdt) &
+    (sig_dhdt < THICK_UNC_THRESHOLD)
+)
     for m in range(M):
         mask_dhdt &= np.isfinite(F_dhdt[m, :])
-    
+
     n_dhdt_total = y_dhdt.size
+
     y_dhdt = y_dhdt[mask_dhdt]
     sig_dhdt = sig_dhdt[mask_dhdt]
     F_dhdt = F_dhdt[:, mask_dhdt]
+
+    # thickness speed = 0
+    speed_dhdt = np.zeros_like(y_dhdt, dtype=float)
+
     n_dhdt = y_dhdt.size
-    
+
     print(f"\ndh/dt data:")
     print(f"  Total points: {n_dhdt_total:,}")
     print(f"  Valid points: {n_dhdt:,} ({100*n_dhdt/n_dhdt_total:.2f}%)")
-    
-    # --- VELOCITY ---
+
+    # ==========================================================
+    # VELOCITY CHANGE (dv/dt)
+    # ==========================================================
+
     y_vel_list = []
     sig_vel_list = []
     F_vel_list = []
-    
-    for year in obs_vel_years:
-        if year not in vx_obs_dict or year not in vy_obs_dict:
-            continue
-        
-        # Obs vx, vy for this year
-        vx_obs = vx_obs_dict[year].reshape(-1)
-        vy_obs = vy_obs_dict[year].reshape(-1)
-        
-        # Obs uncertainties for this year
-        vx_err = vx_err_dict[year].reshape(-1)
-        vy_err = vy_err_dict[year].reshape(-1)
-        
-        # Model vx, vy for this year (from all ensemble members)
-        vx_models = []
-        vy_models = []
-        skip_year = False
-        
+    speed_vel_list = []
+
+    n_intervals = dvxdt_obs.sizes["time"]
+
+    # build mean observed speed field once
+    speed_mean = None
+    if VX_obs_dict is not None and VY_obs_dict is not None and obs_vel_years is not None:
+        speed_fields = []
+        for year in obs_vel_years:
+            if year in VX_obs_dict and year in VY_obs_dict:
+                vx = VX_obs_dict[year]
+                vy = VY_obs_dict[year]
+                speed_fields.append(np.sqrt(vx**2 + vy**2))
+
+        if len(speed_fields) == 0:
+            raise RuntimeError("No velocity fields found for speed calculation")
+
+        speed_mean = np.nanmean(np.stack(speed_fields), axis=0)
+
+    for i in range(n_intervals):
+
+        dvx_obs = dvxdt_obs.isel(time=i).values.reshape(-1)
+        dvy_obs = dvydt_obs.isel(time=i).values.reshape(-1)
+
+        dvx_err = dvxdt_unc.isel(time=i).values.reshape(-1)
+        dvy_err = dvydt_unc.isel(time=i).values.reshape(-1)
+
+        dvx_models = []
+        dvy_models = []
+
         for m in range(M):
-            if vx_models_dict[m][year] is None or vy_models_dict[m][year] is None:
-                skip_year = True
-                break
-            vx_models.append(vx_models_dict[m][year].reshape(-1))
-            vy_models.append(vy_models_dict[m][year].reshape(-1))
-        
-        if skip_year:
-            print(f"  Skipping year {year} - missing model data")
-            continue
-        
-        # Stack vx and vy together (obs and uncertainties)
-        y_vel_year = np.concatenate([vx_obs, vy_obs])
-        sig_vel_year = np.concatenate([vx_err, vy_err])  # NOW USING ACTUAL ERRORS
-        
-        F_vel_year = np.zeros((M, len(y_vel_year)))
+            dvx_models.append(dvxdt_models[m].isel(time=i).values.reshape(-1))
+            dvy_models.append(dvydt_models[m].isel(time=i).values.reshape(-1))
+
+        y_vel_interval = np.concatenate([dvx_obs, dvy_obs])
+        sig_vel_interval = np.concatenate([dvx_err, dvy_err])
+
+        F_vel_interval = np.zeros((M, len(y_vel_interval)))
         for m in range(M):
-            F_vel_year[m, :] = np.concatenate([vx_models[m], vy_models[m]])
-        
-        # Mask invalid (including uncertainty)
-        mask_vel = np.isfinite(y_vel_year) & np.isfinite(sig_vel_year)
+            F_vel_interval[m, :] = np.concatenate([dvx_models[m], dvy_models[m]])
+
+        # speed repeated for vx and vy blocks
+        if speed_mean is not None:
+            speed_flat = speed_mean.reshape(-1)
+            speed_interval = np.concatenate([speed_flat, speed_flat])
+        else:
+            speed_interval = np.full_like(y_vel_interval, np.nan, dtype=float)
+
+        # mask_vel = np.isfinite(y_vel_interval) & np.isfinite(sig_vel_interval) & np.isfinite(speed_interval)
+        mask_vel = (
+            np.isfinite(y_vel_interval) &
+            np.isfinite(sig_vel_interval) &
+            np.isfinite(speed_interval) &
+            (sig_vel_interval < VEL_UNC_THRESHOLD)
+        )
         for m in range(M):
-            mask_vel &= np.isfinite(F_vel_year[m, :])
-        
-        n_vel_total = len(y_vel_year)
+            mask_vel &= np.isfinite(F_vel_interval[m, :])
+
+        n_vel_total = len(y_vel_interval)
         n_vel_valid = int(mask_vel.sum())
-        
-        # Print uncertainty statistics for this year
-        valid_err = sig_vel_year[mask_vel]
-        print(f"  Year {year}: {n_vel_valid:,}/{n_vel_total:,} valid vel points ({100*n_vel_valid/n_vel_total:.2f}%)")
-        print(f"      Uncertainty range: {np.nanmin(valid_err):.2f} - {np.nanmax(valid_err):.2f} m/yr")
-        print(f"      Uncertainty median: {np.nanmedian(valid_err):.2f} m/yr")
-        
-        y_vel_list.append(y_vel_year[mask_vel])
-        sig_vel_list.append(sig_vel_year[mask_vel])
-        F_vel_list.append(F_vel_year[:, mask_vel])
-    
-    # Combine all velocity data
+
+        valid_err = sig_vel_interval[mask_vel]
+
+        print(f"  Interval {i}: {n_vel_valid:,}/{n_vel_total:,} valid dv/dt points")
+        removed = n_vel_total - n_vel_valid
+        print(f"      Removed high-uncertainty pixels: {removed:,}")
+
+        if n_vel_valid > 0:
+            print(f"      Uncertainty range: {np.nanmin(valid_err):.4f} - {np.nanmax(valid_err):.4f} m/yr²")
+            print(f"      Uncertainty median: {np.nanmedian(valid_err):.4f} m/yr²")
+
+        y_vel_list.append(y_vel_interval[mask_vel])
+        sig_vel_list.append(sig_vel_interval[mask_vel])
+        F_vel_list.append(F_vel_interval[:, mask_vel])
+        speed_vel_list.append(speed_interval[mask_vel])
+
     if len(y_vel_list) > 0:
         y_vel = np.concatenate(y_vel_list)
         sig_vel = np.concatenate(sig_vel_list)
         F_vel = np.concatenate(F_vel_list, axis=1)
+        speed_vel = np.concatenate(speed_vel_list)
+
         n_vel = y_vel.size
-        print(f"\nTotal velocity data: {n_vel:,} points")
-        print(f"Overall velocity uncertainty: {np.nanmin(sig_vel):.2f} - {np.nanmax(sig_vel):.2f} m/yr (median: {np.nanmedian(sig_vel):.2f})")
+
+        print(f"\nTotal velocity change data: {n_vel:,} points")
+        print(f"Overall dv/dt uncertainty: {np.nanmin(sig_vel):.4f} - {np.nanmax(sig_vel):.4f} m/yr²")
     else:
         y_vel = np.array([])
         sig_vel = np.array([])
         F_vel = np.zeros((M, 0))
+        speed_vel = np.array([])
         n_vel = 0
-        print("\n⚠️  No valid velocity data found")
-    
-    # --- COMBINE ---
+        print("\n⚠️  No valid velocity change data found")
+
+    # ==========================================================
+    # COMBINE
+    # ==========================================================
+
     y_combined = np.concatenate([y_dhdt, y_vel])
     sigma_combined = np.concatenate([sig_dhdt, sig_vel])
     F_combined = np.concatenate([F_dhdt, F_vel], axis=1)
-    
+    speed_combined = np.concatenate([speed_dhdt, speed_vel])
+
     print(f"\n{'='*70}")
-    print(f"COMBINED DATA SUMMARY")
+    print("COMBINED DATA SUMMARY")
     print(f"{'='*70}")
     print(f"dh/dt points:    {n_dhdt:,}")
-    print(f"  uncertainty:   {np.nanmin(sig_dhdt):.2f} - {np.nanmax(sig_dhdt):.2f} m/yr (median: {np.nanmedian(sig_dhdt):.2f})")
-    print(f"Velocity points: {n_vel:,}")
+    print(f"  uncertainty:   {np.nanmin(sig_dhdt):.2f} - {np.nanmax(sig_dhdt):.2f} m/yr")
+    print(f"dv/dt points:    {n_vel:,}")
     if n_vel > 0:
-        print(f"  uncertainty:   {np.nanmin(sig_vel):.2f} - {np.nanmax(sig_vel):.2f} m/yr (median: {np.nanmedian(sig_vel):.2f})")
+        print(f"  uncertainty:   {np.nanmin(sig_vel):.4f} - {np.nanmax(sig_vel):.4f} m/yr²")
     print(f"Total points:    {len(y_combined):,}")
     print(f"Ensemble size:   {M}")
-    
-    return y_combined, sigma_combined, F_combined, n_dhdt, n_vel
+
+    if not np.all(np.isfinite(speed_combined)):
+        raise RuntimeError("speed_combined still contains NaNs after masking")
+
+    return y_combined, sigma_combined, F_combined, speed_combined, n_dhdt, n_vel
+# def flatten_and_mask_combined(
+#     dhdt_obs, dhdt_sigma, dhdt_models,
+#     dvxdt_obs, dvydt_obs,
+#     dvxdt_unc, dvydt_unc,
+#     dvxdt_models, dvydt_models,
+# ):
+#     """
+#     Flatten and combine thickness change (dh/dt) and velocity change (dv/dt) data.
+#     Uses propagated uncertainties for dv/dt.
+#     """
+
+#     M = len(dhdt_models)
+
+#     # ==========================================================
+#     # THICKNESS CHANGE (dh/dt)
+#     # ==========================================================
+
+#     y_dhdt = dhdt_obs.values.reshape(-1)
+#     sig_dhdt = dhdt_sigma.values.reshape(-1)
+
+#     F_dhdt = np.stack([m.values.reshape(-1) for m in dhdt_models], axis=0)
+
+#     mask_dhdt = np.isfinite(y_dhdt) & np.isfinite(sig_dhdt)
+
+#     for m in range(M):
+#         mask_dhdt &= np.isfinite(F_dhdt[m, :])
+
+#     n_dhdt_total = y_dhdt.size
+
+#     y_dhdt = y_dhdt[mask_dhdt]
+#     sig_dhdt = sig_dhdt[mask_dhdt]
+#     F_dhdt = F_dhdt[:, mask_dhdt]
+
+#     n_dhdt = y_dhdt.size
+
+#     print(f"\ndh/dt data:")
+#     print(f"  Total points: {n_dhdt_total:,}")
+#     print(f"  Valid points: {n_dhdt:,} ({100*n_dhdt/n_dhdt_total:.2f}%)")
+
+#     # ==========================================================
+#     # VELOCITY CHANGE (dv/dt)
+#     # ==========================================================
+
+#     y_vel_list = []
+#     sig_vel_list = []
+#     F_vel_list = []
+
+#     n_intervals = dvxdt_obs.sizes["time"]
+
+#     for i in range(n_intervals):
+
+#         # --- observations ---
+#         dvx_obs = dvxdt_obs.isel(time=i).values.reshape(-1)
+#         dvy_obs = dvydt_obs.isel(time=i).values.reshape(-1)
+
+#         dvx_err = dvxdt_unc.isel(time=i).values.reshape(-1)
+#         dvy_err = dvydt_unc.isel(time=i).values.reshape(-1)
+
+#         # --- models ---
+#         dvx_models = []
+#         dvy_models = []
+
+#         for m in range(M):
+
+#             dvx_models.append(
+#                 dvxdt_models[m].isel(time=i).values.reshape(-1)
+#             )
+
+#             dvy_models.append(
+#                 dvydt_models[m].isel(time=i).values.reshape(-1)
+#             )
+
+#         # --- stack vx + vy components ---
+#         y_vel_interval = np.concatenate([dvx_obs, dvy_obs])
+#         sig_vel_interval = np.concatenate([dvx_err, dvy_err])
+
+#         F_vel_interval = np.zeros((M, len(y_vel_interval)))
+
+#         for m in range(M):
+
+#             F_vel_interval[m, :] = np.concatenate(
+#                 [dvx_models[m], dvy_models[m]]
+#             )
+
+#         # --- mask invalid ---
+#         mask_vel = np.isfinite(y_vel_interval) & np.isfinite(sig_vel_interval)
+
+#         for m in range(M):
+#             mask_vel &= np.isfinite(F_vel_interval[m, :])
+
+#         n_vel_total = len(y_vel_interval)
+#         n_vel_valid = int(mask_vel.sum())
+
+#         valid_err = sig_vel_interval[mask_vel]
+
+#         print(
+#             f"  Interval {i}: {n_vel_valid:,}/{n_vel_total:,} valid dv/dt points"
+#         )
+
+#         if n_vel_valid > 0:
+#             print(
+#                 f"      Uncertainty range: {np.nanmin(valid_err):.4f} - {np.nanmax(valid_err):.4f} m/yr²"
+#             )
+#             print(
+#                 f"      Uncertainty median: {np.nanmedian(valid_err):.4f} m/yr²"
+#             )
+
+#         y_vel_list.append(y_vel_interval[mask_vel])
+#         sig_vel_list.append(sig_vel_interval[mask_vel])
+#         F_vel_list.append(F_vel_interval[:, mask_vel])
+
+#     # ==========================================================
+#     # COMBINE ALL VELOCITY INTERVALS
+#     # ==========================================================
+
+#     if len(y_vel_list) > 0:
+
+#         y_vel = np.concatenate(y_vel_list)
+#         sig_vel = np.concatenate(sig_vel_list)
+#         F_vel = np.concatenate(F_vel_list, axis=1)
+
+#         n_vel = y_vel.size
+
+#         print(f"\nTotal velocity change data: {n_vel:,} points")
+
+#         print(
+#             f"Overall dv/dt uncertainty: {np.nanmin(sig_vel):.4f} - {np.nanmax(sig_vel):.4f} m/yr²"
+#         )
+
+#     else:
+
+#         y_vel = np.array([])
+#         sig_vel = np.array([])
+#         F_vel = np.zeros((M, 0))
+#         n_vel = 0
+
+#         print("\n⚠️  No valid velocity change data found")
+
+#     # ==========================================================
+#     # COMBINE dh/dt + dv/dt
+#     # ==========================================================
+
+#     y_combined = np.concatenate([y_dhdt, y_vel])
+#     sigma_combined = np.concatenate([sig_dhdt, sig_vel])
+
+#     F_combined = np.concatenate([F_dhdt, F_vel], axis=1)
+
+#     print(f"\n{'='*70}")
+#     print("COMBINED DATA SUMMARY")
+#     print(f"{'='*70}")
+
+#     print(f"dh/dt points:    {n_dhdt:,}")
+
+#     print(
+#         f"  uncertainty:   {np.nanmin(sig_dhdt):.2f} - {np.nanmax(sig_dhdt):.2f} m/yr"
+#     )
+
+#     print(f"dv/dt points:    {n_vel:,}")
+
+#     if n_vel > 0:
+
+#         print(
+#             f"  uncertainty:   {np.nanmin(sig_vel):.4f} - {np.nanmax(sig_vel):.4f} m/yr²"
+#         )
+
+#     print(f"Total points:    {len(y_combined):,}")
+#     print(f"Ensemble size:   {M}")
+
+#     return y_combined, sigma_combined, F_combined, n_dhdt, n_vel
 
 # ==============================================================================
 # LOAD + PREP
 # ==============================================================================
 
+# def load_and_prepare_data():
+
+#     # ----------------------- PATHS -----------------------
+#     OBS_THICKNESS_DIR = "/Users/sp53972/Library/CloudStorage/Box-Box/Main/Projects/Modern Data Model Scoring to SLR/inputs/761_obs/761 elev"
+#     THICKNESS_PATTERN = "elev_antarctica_elevation_*.nc"
+#     OBS_THICKNESS_VAR = "height"
+#     OBS_THICKNESS_RMSE_VAR = "absolute_elevation_rmse"
+
+#     OBS_VELOCITY_DIR = "/Users/sp53972/Library/CloudStorage/Box-Box/Main/Projects/Modern Data Model Scoring to SLR/inputs/761_obs/761 veloc"
+#     VELOCITY_PATTERN = "vel_Antarctica_ice_velocity_*.nc"
+
+#     OBS_VX_VAR = "VX"
+#     OBS_VY_VAR = "VY"
+#     OBS_VX_ERR_VAR = "ERRX"
+#     OBS_VY_ERR_VAR = "ERRY"
+
+#     # --------------------------------------------------
+#     # LOAD OBS VELOCITY
+#     # --------------------------------------------------
+
+#     VX_obs, VY_obs, VX_ERR_obs, VY_ERR_obs, obs_vel_years = load_obs_velocity_yearly(
+#         OBS_VELOCITY_DIR,
+#         VELOCITY_PATTERN,
+#         OBS_VX_VAR,
+#         OBS_VY_VAR,
+#         OBS_VX_ERR_VAR,
+#         OBS_VY_ERR_VAR,
+#     )
+
+#     from pathlib import Path
+#     import glob
+
+#     # ----------------------- MODEL PATHS -----------------------
+
+#     MODEL_DIR = "/Users/sp53972/Library/CloudStorage/Box-Box/Main/Projects/Modern Data Model Scoring to SLR/inputs/ch1_ensemble/ensemble_2/regridded"
+#     MODEL_PATTERN = "*_regridded.nc"
+
+#     MODEL_PATHS = sorted(glob.glob(MODEL_DIR + "/" + MODEL_PATTERN))
+
+#     print("Found", len(MODEL_PATHS), "model files")
+
+#     MODEL_THICKNESS_VAR = "h"
+#     MODEL_VX_VAR = "ua"
+#     MODEL_VY_VAR = "va"
+
+#     # --------------------------------------------------
+#     # LOAD FIRST MODEL FOR TIME AXIS
+#     # --------------------------------------------------
+
+#     print("=" * 70)
+#     print("LOADING MODEL ENSEMBLE")
+#     print("=" * 70)
+
+#     ds0 = xr.open_dataset(MODEL_PATHS[0], engine="netcdf4", decode_times=False)
+
+#     model_years0 = model_decimal_years_from_ds(ds0, time_name="time")
+
+#     dhdt0, t0, tmid0, dt0 = compute_model_dhdt(
+#         ds0,
+#         model_years0,
+#         model_thickness_var=MODEL_THICKNESS_VAR,
+#     )
+
+#     print(
+#         f"Canonical model years: {model_years0[0]:.3f} .. {model_years0[-1]:.3f} (n={len(model_years0)})"
+#     )
+#     print(
+#         f"Canonical dh/dt times: {float(tmid0.min()):.3f} .. {float(tmid0.max()):.3f} (n={len(tmid0)})"
+#     )
+
+#     # --------------------------------------------------
+#     # LOAD MODELS
+#     # --------------------------------------------------
+
+#     ensemble_dhdt = []
+#     vx_models_by_member = []
+#     vy_models_by_member = []
+
+#     for i, fp in enumerate(MODEL_PATHS, 1):
+
+#         print("\n" + "=" * 70)
+#         print(f"MODEL {i}/{len(MODEL_PATHS)}: {Path(fp).name}")
+#         print("=" * 70)
+
+#         ds = xr.open_dataset(fp, engine="netcdf4", decode_times=False)
+
+#         model_years = model_decimal_years_from_ds(ds, time_name="time")
+
+#         # ------------------------------
+#         # dh/dt
+#         # ------------------------------
+
+#         dhdt, t, tmid, dt = compute_model_dhdt(
+#             ds,
+#             model_years,
+#             model_thickness_var=MODEL_THICKNESS_VAR,
+#         )
+
+#         if dhdt.sizes["time"] == len(tmid0):
+
+#             dhdt = dhdt.assign_coords(time=tmid0.astype(float))
+
+#         else:
+
+#             dhdt = dhdt.reindex(
+#                 time=tmid0.astype(float),
+#                 method="nearest",
+#                 tolerance=1e-3,
+#             )
+
+#         ensemble_dhdt.append(dhdt)
+
+#         # ------------------------------
+#         # dv/dt
+#         # ------------------------------
+
+#         dvxdt, dvydt = compute_model_velocity_change(
+#             ds,
+#             model_years,
+#             vx_var=MODEL_VX_VAR,
+#             vy_var=MODEL_VY_VAR,
+#         )
+
+#         # vx_dict = {float(t): dvxdt.sel(time=t).values for t in dvxdt.time.values}
+#         # vy_dict = {float(t): dvydt.sel(time=t).values for t in dvydt.time.values}
+
+#         # vx_models_by_member.append(vx_dict)
+#         # vy_models_by_member.append(vy_dict)
+#         vx_models_by_member.append(dvxdt)
+#         vy_models_by_member.append(dvydt)
+
+#         ds.close()
+
+#     # --------------------------------------------------
+#     # OBS dh/dt
+#     # --------------------------------------------------
+
+#     print("\n" + "=" * 70)
+#     print("COMPUTING OBS dh/dt ON MODEL INTERVALS")
+#     print("=" * 70)
+
+#     obs_dhdt, obs_unc, has_thickness_unc = compute_obs_dhdt_on_model_intervals(
+#         obs_thickness_dir=OBS_THICKNESS_DIR,
+#         thickness_pattern=THICKNESS_PATTERN,
+#         obs_h_var=OBS_THICKNESS_VAR,
+#         obs_rmse_var=OBS_THICKNESS_RMSE_VAR,
+#         model_t=t0,
+#         model_tmid=tmid0,
+#         model_dt=dt0,
+#     )
+
+#     # --------------------------------------------------
+#     # OBS dv/dt
+#     # --------------------------------------------------
+
+#     print("\n" + "=" * 70)
+#     print("COMPUTING OBS dv/dt ON MODEL INTERVALS")
+#     print("=" * 70)
+
+#     obs_dvxdt, obs_dvydt, obs_uncx, obs_uncy = compute_obs_dvdt_on_model_intervals(
+#         VX_obs,
+#         VY_obs,
+#         VX_ERR_obs,
+#         VY_ERR_obs,
+#         obs_vel_years,
+#         t0,
+#         tmid0,
+#         dt0,
+#     )
+
+#     # --------------------------------------------------
+#     # RETURN DATA
+#     # --------------------------------------------------
+
+#     return {
+
+#         "obs_dhdt": obs_dhdt,
+#         "obs_unc": obs_unc,
+#         "has_thickness_unc": has_thickness_unc,
+#         "ensemble_dhdt": ensemble_dhdt,
+
+#         "obs_dvxdt": obs_dvxdt,
+#         "obs_dvydt": obs_dvydt,
+#         "obs_uncx": obs_uncx,
+#         "obs_uncy": obs_uncy,
+
+#         "VX_obs": VX_obs,
+#         "VY_obs": VY_obs,
+#         "VX_ERR_obs": VX_ERR_obs,
+#         "VY_ERR_obs": VY_ERR_obs,
+#         "obs_vel_years": obs_vel_years,
+
+#         "vx_models": vx_models_by_member,
+#         "vy_models": vy_models_by_member,
+
+#         "M": len(ensemble_dhdt),
+#     }
+
+
 def load_and_prepare_data():
+
     # ----------------------- PATHS -----------------------
     OBS_THICKNESS_DIR = "/Users/sp53972/Library/CloudStorage/Box-Box/Main/Projects/Modern Data Model Scoring to SLR/inputs/761_obs/761 elev"
     THICKNESS_PATTERN = "elev_antarctica_elevation_*.nc"
@@ -532,78 +1216,168 @@ def load_and_prepare_data():
 
     OBS_VELOCITY_DIR = "/Users/sp53972/Library/CloudStorage/Box-Box/Main/Projects/Modern Data Model Scoring to SLR/inputs/761_obs/761 veloc"
     VELOCITY_PATTERN = "vel_Antarctica_ice_velocity_*.nc"
+
     OBS_VX_VAR = "VX"
     OBS_VY_VAR = "VY"
-    #VELOCITY_UNCERTAINTY = 10.0  # m/yr - assumed uncertainty for velocity obs
-    OBS_VX_ERR_VAR = "ERRX"  # ADD THIS LINE
-    OBS_VY_ERR_VAR = "ERRY"  # ADD THIS LINE
+    OBS_VX_ERR_VAR = "ERRX"
+    OBS_VY_ERR_VAR = "ERRY"
 
-# Load obs velocity WITH uncertainties
+    # --------------------------------------------------
+    # LOAD OBS VELOCITY
+    # --------------------------------------------------
     VX_obs, VY_obs, VX_ERR_obs, VY_ERR_obs, obs_vel_years = load_obs_velocity_yearly(
-    OBS_VELOCITY_DIR, VELOCITY_PATTERN, 
-    OBS_VX_VAR, OBS_VY_VAR,
-    OBS_VX_ERR_VAR, OBS_VY_ERR_VAR  # ADD THESE
+        OBS_VELOCITY_DIR,
+        VELOCITY_PATTERN,
+        OBS_VX_VAR,
+        OBS_VY_VAR,
+        OBS_VX_ERR_VAR,
+        OBS_VY_ERR_VAR,
     )
 
-    MODEL_PATHS = [
-        '/Users/sp53972/Library/CloudStorage/Box-Box/Main/Projects/Modern Data Model Scoring to SLR/inputs/ch1_ensemble/run1_regridded.nc',
-        '/Users/sp53972/Library/CloudStorage/Box-Box/Main/Projects/Modern Data Model Scoring to SLR/inputs/ch1_ensemble/run2_regridded.nc',
-        '/Users/sp53972/Library/CloudStorage/Box-Box/Main/Projects/Modern Data Model Scoring to SLR/inputs/ch1_ensemble/run9_regridded.nc',
-    ]
+    from pathlib import Path
+    import glob
+
+    # ----------------------- MODEL PATHS -----------------------
+    MODEL_DIR = "/Users/sp53972/Library/CloudStorage/Box-Box/Main/Projects/Modern Data Model Scoring to SLR/inputs/ch1_ensemble/ensemble_2/regridded"
+    MODEL_PATTERN = "*_regridded.nc"
+
+    MODEL_PATHS = sorted(glob.glob(MODEL_DIR + "/" + MODEL_PATTERN))
+
+    print("Found", len(MODEL_PATHS), "model files")
+
     MODEL_THICKNESS_VAR = "h"
     MODEL_VX_VAR = "ua"
     MODEL_VY_VAR = "va"
-    # ---------------------------------------------------------------------
 
+    # --------------------------------------------------
+    # HELPER: clean bad time entries and mask dataset
+    # --------------------------------------------------
+    def _clean_and_mask_time(ds, time_name="time"):
+        time_var = ds[time_name]
+        t_raw = np.asarray(time_var.values, dtype=float)
+
+        fill_value = time_var.attrs.get("_FillValue", None)
+        missing_value = time_var.attrs.get("missing_value", None)
+
+        if fill_value is not None:
+            t_raw[t_raw == fill_value] = np.nan
+        if missing_value is not None:
+            t_raw[t_raw == missing_value] = np.nan
+
+        # catch absurd NetCDF placeholders
+        t_raw[np.abs(t_raw) > 1e20] = np.nan
+
+        good_time = np.isfinite(t_raw)
+
+        if not np.any(good_time):
+            raise ValueError("No valid time values found in model file")
+
+        n_bad = int(np.sum(~good_time))
+        if n_bad > 0:
+            print(f"  Warning: removed {n_bad} invalid time value(s)")
+
+        ds = ds.isel(time=good_time)
+
+        return ds
+
+    # --------------------------------------------------
+    # LOAD FIRST MODEL FOR CANONICAL TIME AXIS
+    # --------------------------------------------------
     print("=" * 70)
     print("LOADING MODEL ENSEMBLE")
     print("=" * 70)
 
-    # Load first model for canonical time axis
     ds0 = xr.open_dataset(MODEL_PATHS[0], engine="netcdf4", decode_times=False)
+    ds0 = _clean_and_mask_time(ds0, time_name="time")
+
     model_years0 = model_decimal_years_from_ds(ds0, time_name="time")
-    dhdt0, t0, tmid0, dt0 = compute_model_dhdt(ds0, model_years0, model_thickness_var=MODEL_THICKNESS_VAR)
 
-    print(f"Canonical model years: {model_years0[0]:.3f} .. {model_years0[-1]:.3f} (n={len(model_years0)})")
-    print(f"Canonical dh/dt times: {float(tmid0.min()):.3f} .. {float(tmid0.max()):.3f} (n={len(tmid0)})")
+    dhdt0, t0, tmid0, dt0 = compute_model_dhdt(
+        ds0,
+        model_years0,
+        model_thickness_var=MODEL_THICKNESS_VAR,
+    )
 
-    # Load obs velocity to get years
-   
-    # Load all models
+    print(
+        f"Canonical model years: {model_years0[0]:.3f} .. {model_years0[-1]:.3f} (n={len(model_years0)})"
+    )
+    print(
+        f"Canonical dh/dt times: {float(tmid0.min()):.3f} .. {float(tmid0.max()):.3f} (n={len(tmid0)})"
+    )
+
+    ds0.close()
+
+    # --------------------------------------------------
+    # LOAD MODELS
+    # --------------------------------------------------
     ensemble_dhdt = []
-    vx_models_by_member = []  # list of dicts: [{year: vx_array}, ...]
+    vx_models_by_member = []
     vy_models_by_member = []
-    
+
     for i, fp in enumerate(MODEL_PATHS, 1):
-        print(f"\n{'='*70}")
+
+        print("\n" + "=" * 70)
         print(f"MODEL {i}/{len(MODEL_PATHS)}: {Path(fp).name}")
-        print(f"{'='*70}")
-        
+        print("=" * 70)
+
         ds = xr.open_dataset(fp, engine="netcdf4", decode_times=False)
+        ds = _clean_and_mask_time(ds, time_name="time")
+
         model_years = model_decimal_years_from_ds(ds, time_name="time")
-        
+
+        # ------------------------------
         # dh/dt
-        dhdt, t, tmid, dt = compute_model_dhdt(ds, model_years, model_thickness_var=MODEL_THICKNESS_VAR)
+        # ------------------------------
+        dhdt, t, tmid, dt = compute_model_dhdt(
+            ds,
+            model_years,
+            model_thickness_var=MODEL_THICKNESS_VAR,
+        )
+
         if dhdt.sizes["time"] == len(tmid0):
             dhdt = dhdt.assign_coords(time=tmid0.astype(float))
         else:
-            dhdt = dhdt.reindex(time=tmid0.astype(float), method="nearest", tolerance=1e-3)
+            dhdt = dhdt.reindex(
+                time=tmid0.astype(float),
+                method="nearest",
+                tolerance=1e-3,
+            )
+
         ensemble_dhdt.append(dhdt)
-        
-        # Velocity at obs years
-        vx_list, vy_list = compute_model_velocity_on_obs_years(
-            ds, model_years, obs_vel_years, vx_var=MODEL_VX_VAR, vy_var=MODEL_VY_VAR
+
+        # ------------------------------
+        # dv/dt
+        # ------------------------------
+        dvxdt, dvydt = compute_model_velocity_change(
+            ds,
+            model_years,
+            vx_var=MODEL_VX_VAR,
+            vy_var=MODEL_VY_VAR,
         )
-        
-        vx_dict = {year: vx for year, vx in zip(obs_vel_years, vx_list)}
-        vy_dict = {year: vy for year, vy in zip(obs_vel_years, vy_list)}
-        
-        vx_models_by_member.append(vx_dict)
-        vy_models_by_member.append(vy_dict)
-        
+
+        if dvxdt.sizes["time"] == len(tmid0):
+            dvxdt = dvxdt.assign_coords(time=tmid0.astype(float))
+            dvydt = dvydt.assign_coords(time=tmid0.astype(float))
+        else:
+            dvxdt = dvxdt.reindex(
+                time=tmid0.astype(float),
+                method="nearest",
+                tolerance=1e-3,
+            )
+            dvydt = dvydt.reindex(
+                time=tmid0.astype(float),
+                method="nearest",
+                tolerance=1e-3,
+            )
+
+        vx_models_by_member.append(dvxdt)
+        vy_models_by_member.append(dvydt)
+
         ds.close()
 
-    # Compute obs dh/dt
+    # --------------------------------------------------
+    # OBS dh/dt
+    # --------------------------------------------------
     print("\n" + "=" * 70)
     print("COMPUTING OBS dh/dt ON MODEL INTERVALS")
     print("=" * 70)
@@ -618,21 +1392,49 @@ def load_and_prepare_data():
         model_dt=dt0,
     )
 
+    # --------------------------------------------------
+    # OBS dv/dt
+    # --------------------------------------------------
+    print("\n" + "=" * 70)
+    print("COMPUTING OBS dv/dt ON MODEL INTERVALS")
+    print("=" * 70)
+
+    obs_dvxdt, obs_dvydt, obs_uncx, obs_uncy = compute_obs_dvdt_on_model_intervals(
+        VX_obs,
+        VY_obs,
+        VX_ERR_obs,
+        VY_ERR_obs,
+        obs_vel_years,
+        t0,
+        tmid0,
+        dt0,
+    )
+
+    # --------------------------------------------------
+    # RETURN DATA
+    # --------------------------------------------------
     return {
         "obs_dhdt": obs_dhdt,
         "obs_unc": obs_unc,
         "has_thickness_unc": has_thickness_unc,
         "ensemble_dhdt": ensemble_dhdt,
+
+        "obs_dvxdt": obs_dvxdt,
+        "obs_dvydt": obs_dvydt,
+        "obs_uncx": obs_uncx,
+        "obs_uncy": obs_uncy,
+
         "VX_obs": VX_obs,
         "VY_obs": VY_obs,
-        "VX_ERR_obs": VX_ERR_obs,  
-        "VY_ERR_obs": VY_ERR_obs,  
+        "VX_ERR_obs": VX_ERR_obs,
+        "VY_ERR_obs": VY_ERR_obs,
         "obs_vel_years": obs_vel_years,
+
         "vx_models": vx_models_by_member,
         "vy_models": vy_models_by_member,
+
         "M": len(ensemble_dhdt),
     }
-
 
 def prepare_for_inference(data_dict):
     obs_dhdt = data_dict["obs_dhdt"]
@@ -655,102 +1457,193 @@ def prepare_for_inference(data_dict):
             obs_unc_filled = obs_unc.where(np.isfinite(obs_unc), other=fill_val)
 
     # Remove time slices with all-NaN obs
-    good_time = np.isfinite(obs_dhdt.mean(dim=("y", "x"), skipna=True))
-    obs_dhdt = obs_dhdt.sel(time=obs_dhdt.time[good_time])
-    obs_unc_filled = obs_unc_filled.sel(time=obs_unc_filled.time[good_time])
-    ens_dhdt = [m.sel(time=obs_dhdt.time) for m in ens_dhdt]
+    # good_time = np.isfinite(obs_dhdt.mean(dim=("y", "x"), skipna=True))
+    # obs_dhdt = obs_dhdt.sel(time=obs_dhdt.time[good_time])
+    # obs_unc_filled = obs_unc_filled.sel(time=obs_unc_filled.time[good_time])
+    # ens_dhdt = [m.sel(time=obs_dhdt.time) for m in ens_dhdt]
 
     print(f"\nThickness time points kept: {obs_dhdt.sizes['time']}")
 
     # Flatten and combine
-    y_inf, sigma_inf, F_inf, n_dhdt, n_vel = flatten_and_mask_combined(
-        dhdt_obs=obs_dhdt,
-        dhdt_sigma=obs_unc_filled,
-        dhdt_models=ens_dhdt,
-        vx_obs_dict=data_dict["VX_obs"],
-        vy_obs_dict=data_dict["VY_obs"],
-        vx_err_dict=data_dict["VX_ERR_obs"],
-        vy_err_dict=data_dict["VY_ERR_obs"],
-        vx_models_dict=data_dict["vx_models"],
-        vy_models_dict=data_dict["vy_models"],
-        obs_vel_years=data_dict["obs_vel_years"],
-    )
-
-    # --- BUILD SPEED VECTOR ---
-    # dh/dt points: speed = 0 (no velocity-dependent model error for thickness)
-    speed_dhdt = np.zeros(n_dhdt, dtype=float)
-
-    # Velocity points: |v| = sqrt(vx^2 + vy^2), same masking as flatten_and_mask_combined
-    speed_vel_list = []
-    obs_vel_years = data_dict["obs_vel_years"]
-
-    for year in obs_vel_years:
-        VX_obs = data_dict["VX_obs"]
-        VY_obs = data_dict["VY_obs"]
-        VX_ERR = data_dict["VX_ERR_obs"]
-        VY_ERR = data_dict["VY_ERR_obs"]
-
-        if year not in VX_obs or year not in VY_obs:
-            continue
-
-        vx_obs = VX_obs[year].reshape(-1)
-        vy_obs = VY_obs[year].reshape(-1)
-        vx_err = VX_ERR[year].reshape(-1)
-        vy_err = VY_ERR[year].reshape(-1)
-
-        # speed repeated for vx block and vy block (same spatial location)
-        speed_year = np.concatenate([
-            np.sqrt(vx_obs**2 + vy_obs**2),
-            np.sqrt(vx_obs**2 + vy_obs**2),
-        ])
-
-        y_vel_year = np.concatenate([vx_obs, vy_obs])
-        sig_vel_year = np.concatenate([vx_err, vy_err])
-
-        # Reproduce the exact same mask as in flatten_and_mask_combined
-        mask_vel = np.isfinite(y_vel_year) & np.isfinite(sig_vel_year)
-        skip_year = False
-        for m in range(M):
-            if data_dict["vx_models"][m][year] is None or data_dict["vy_models"][m][year] is None:
-                skip_year = True
-                break
-            vx_m = data_dict["vx_models"][m][year].reshape(-1)
-            vy_m = data_dict["vy_models"][m][year].reshape(-1)
-            F_year = np.concatenate([vx_m, vy_m])
-            mask_vel &= np.isfinite(F_year)
-
-        if skip_year:
-            continue
-
-        speed_vel_list.append(speed_year[mask_vel])
-
-    speed_vel = np.concatenate(speed_vel_list) if speed_vel_list else np.array([])
-    speed = np.concatenate([speed_dhdt, speed_vel])
-
-    assert speed.size == y_inf.size, (
-        f"speed size {speed.size} != y_obs size {y_inf.size}. "
-        "Check that masking logic here matches flatten_and_mask_combined exactly."
-    )
-
-    # return {
-    #     "y_obs": y_inf,
-    #     "sigma_obs": sigma_inf,
-    #     "F": F_inf,
-    #     "speed": speed,
-    #     "M": M,
-    #     "n_obs": y_inf.size,
-    #     "n_dhdt": n_dhdt,
-    #     "n_vel": n_vel,
-    # } this is a temporary change to make it run faster
+# Flatten and combine
+    # y_inf, sigma_inf, F_inf, n_dhdt, n_vel = flatten_and_mask_combined(
+    #     dhdt_obs=obs_dhdt,
+    #     dhdt_sigma=obs_unc_filled,
+    #     dhdt_models=ens_dhdt,
     
+    #     dvxdt_obs=data_dict["obs_dvxdt"],
+    #     dvydt_obs=data_dict["obs_dvydt"],
+    
+    #     dvxdt_unc=data_dict["obs_uncx"],
+    #     dvydt_unc=data_dict["obs_uncy"],
+    
+    #     dvxdt_models=data_dict["vx_models"],
+    #     dvydt_models=data_dict["vy_models"],
+    # )
+    y_inf, sigma_inf, F_inf, speed, n_dhdt, n_vel = flatten_and_mask_combined(
+    dhdt_obs=obs_dhdt,
+    dhdt_sigma=obs_unc_filled,
+    dhdt_models=ens_dhdt,
 
+    dvxdt_obs=data_dict["obs_dvxdt"],
+    dvydt_obs=data_dict["obs_dvydt"],
+
+    dvxdt_unc=data_dict["obs_uncx"],
+    dvydt_unc=data_dict["obs_uncy"],
+
+    dvxdt_models=data_dict["vx_models"],
+    dvydt_models=data_dict["vy_models"],
+
+    VX_obs_dict=data_dict["VX_obs"],
+    VY_obs_dict=data_dict["VY_obs"],
+    obs_vel_years=data_dict["obs_vel_years"],
+    )
+
+    # # --- BUILD SPEED VECTOR ---
+    # # dh/dt points: speed = 0 (no velocity-dependent model error for thickness)
+    # speed_dhdt = np.zeros(n_dhdt, dtype=float)
+
+    # # Velocity points: |v| = sqrt(vx^2 + vy^2), same masking as flatten_and_mask_combined
+    # speed_vel_list = []
+    # obs_vel_years = data_dict["obs_vel_years"]
+
+    # for year in obs_vel_years:
+    #     VX_obs = data_dict["VX_obs"]
+    #     VY_obs = data_dict["VY_obs"]
+    #     VX_ERR = data_dict["VX_ERR_obs"]
+    #     VY_ERR = data_dict["VY_ERR_obs"]
+
+    #     if year not in VX_obs or year not in VY_obs:
+    #         continue
+
+    #     vx_obs = VX_obs[year].reshape(-1)
+    #     vy_obs = VY_obs[year].reshape(-1)
+    #     vx_err = VX_ERR[year].reshape(-1)
+    #     vy_err = VY_ERR[year].reshape(-1)
+
+    #     # speed repeated for vx block and vy block (same spatial location)
+    #     speed_year = np.concatenate([
+    #         np.sqrt(vx_obs**2 + vy_obs**2),
+    #         np.sqrt(vx_obs**2 + vy_obs**2),
+    #     ])
+
+    #     y_vel_year = np.concatenate([vx_obs, vy_obs])
+    #     sig_vel_year = np.concatenate([vx_err, vy_err])
+
+    #     # Reproduce the exact same mask as in flatten_and_mask_combined
+    #     mask_vel = np.isfinite(y_vel_year) & np.isfinite(sig_vel_year)
+    #     skip_year = False
+    #     for m in range(M):
+    #         if data_dict["vx_models"][m][year] is None or data_dict["vy_models"][m][year] is None:
+    #             skip_year = True
+    #             break
+    #         vx_m = data_dict["vx_models"][m][year].reshape(-1)
+    #         vy_m = data_dict["vy_models"][m][year].reshape(-1)
+    #         F_year = np.concatenate([vx_m, vy_m])
+    #         mask_vel &= np.isfinite(F_year)
+
+    #     if skip_year:
+    #         continue
+
+    #     speed_vel_list.append(speed_year[mask_vel])
+
+    # speed_vel = np.concatenate(speed_vel_list) if speed_vel_list else np.array([])
+    # speed = np.concatenate([speed_dhdt, speed_vel])
+
+    # assert speed.size == y_inf.size, (
+    #     f"speed size {speed.size} != y_obs size {y_inf.size}. "
+    #     "Check that masking logic here matches flatten_and_mask_combined exactly."
+    # )
+
+    # # return {
+    # #     "y_obs": y_inf,
+    # #     "sigma_obs": sigma_inf,
+    # #     "F": F_inf,
+    # #     "speed": speed,
+    # #     "M": M,
+    # #     "n_obs": y_inf.size,
+    # #     "n_dhdt": n_dhdt,
+    # #     "n_vel": n_vel,
+    # # } this is a temporary change to make it run faster
+    
+    # # --- BUILD SPEED VECTOR ---
+    
+    # # dh/dt points: speed = 0 (thickness uncertainty independent of speed)
+    # speed_dhdt = np.zeros(n_dhdt, dtype=float)
+    
+    # # Compute mean observed speed field
+    # VX_obs = data_dict["VX_obs"]
+    # VY_obs = data_dict["VY_obs"]
+    
+    # speed_fields = []
+    
+    # for year in data_dict["obs_vel_years"]:
+        
+    #     if year not in VX_obs or year not in VY_obs:
+    #         continue
+        
+    #     vx = VX_obs[year]
+    #     vy = VY_obs[year]
+    
+    #     speed = np.sqrt(vx**2 + vy**2)
+    
+    #     speed_fields.append(speed)
+    
+    # # mean speed across years
+    # speed_mean = np.nanmean(np.stack(speed_fields), axis=0)
+    
+    # # flatten
+    # speed_flat = speed_mean.reshape(-1)
+    
+    # # repeat for vx and vy components
+    # speed_vel = np.concatenate([speed_flat, speed_flat])
+    
+    # # tile for each time interval used in dv/dt
+    # n_repeat = int(np.ceil(n_vel / speed_vel.size))
+    # speed_vel = np.tile(speed_vel, n_repeat)[:n_vel]
+    
+    # speed = np.concatenate([speed_dhdt, speed_vel])
+    
+    # assert speed.size == y_inf.size
+    # --- BUILD SPEED VECTOR ---
+    
+    # speed_dhdt = np.zeros(n_dhdt, dtype=float)
+    
+    # VX_obs = data_dict["VX_obs"]
+    # VY_obs = data_dict["VY_obs"]
+    
+    # speed_fields = []
+    
+    # for year in VX_obs.keys():   # <-- use dictionary keys
+    
+    #     vx = VX_obs[year]
+    #     vy = VY_obs[year]
+    
+    #     speed_fields.append(np.sqrt(vx**2 + vy**2))
+    
+    # # safety check
+    # if len(speed_fields) == 0:
+    #     raise RuntimeError("No velocity fields found for speed calculation")
+    
+    # speed_mean = np.nanmean(np.stack(speed_fields), axis=0)
+    
+    # speed_flat = speed_mean.reshape(-1)
+    
+    # speed_vel = np.concatenate([speed_flat, speed_flat])
+    
+    # n_repeat = int(np.ceil(n_vel / speed_vel.size))
+    # speed_vel = np.tile(speed_vel, n_repeat)[:n_vel]
+    
+    # speed = np.concatenate([speed_dhdt, speed_vel])
         
     # --------------------------------------------------
 # RANDOM SUBSAMPLING FOR MCMC SPEED
 # --------------------------------------------------
+# --------------------------------------------------
+# RANDOM SUBSAMPLING FOR MCMC SPEED
+# --------------------------------------------------
 
-    MAX_POINTS = 20000   # good balance of speed + accuracy
-    
+    MAX_POINTS = 20000
     n_total = y_inf.size
     
     if n_total > MAX_POINTS:
@@ -768,7 +1661,13 @@ def prepare_for_inference(data_dict):
     
         print(f"Using {MAX_POINTS:,} randomly sampled points")
     
-    # --------------------------------------------------
+        is_thick = idx < n_dhdt
+        n_dhdt_new = int(np.sum(is_thick))
+        n_vel_new = int(MAX_POINTS - n_dhdt_new)
+    
+    else:
+        n_dhdt_new = n_dhdt
+        n_vel_new = n_vel
     
     return {
         "y_obs": y_inf,
@@ -777,19 +1676,16 @@ def prepare_for_inference(data_dict):
         "speed": speed,
         "M": M,
         "n_obs": y_inf.size,
-        # "n_dhdt": min(n_dhdt, y_inf.size),
-        # "n_vel": min(n_vel, y_inf.size),
-        "n_dhdt": int(np.sum(idx < n_dhdt)) if n_total > MAX_POINTS else n_dhdt,
-        "n_vel": y_inf.size - int(np.sum(idx < n_dhdt)) if n_total > MAX_POINTS else n_vel,
-        }
-
+        "n_dhdt": n_dhdt_new,
+        "n_vel": n_vel_new,
+    }
 
 # BAYESIAN MODEL
 # ==============================================================================
 
 import numpy as np
 import pymc as pm
-
+VEL_SCALE = 1000.0
 def build_model_proposal(data):
     """
     Equal weighting of thickness and velocity log-likelihoods.
@@ -809,11 +1705,18 @@ def build_model_proposal(data):
     N = float(y.size)
 
     with pm.Model() as model:
-        sigma_base_thick = pm.HalfNormal("sigma_base_thick", sigma=2.0) #tighter prior on uncertainty 
-        #sigma_base_thick = pm.HalfNormal("sigma_base_thick", sigma=30.0) #really wide prior on model uncertainty
-        beta_thick       = pm.HalfNormal("beta_thick", sigma=0.5)
-        sigma_base_vel   = pm.HalfNormal("sigma_base_vel", sigma=20.0)
-        beta_vel         = pm.HalfNormal("beta_vel", sigma=0.5)
+        # sigma_base_thick = pm.HalfNormal("sigma_base_thick", sigma=2.0) #tighter prior on uncertainty 
+        # #sigma_base_thick = pm.HalfNormal("sigma_base_thick", sigma=30.0) #really wide prior on model uncertainty
+        # beta_thick       = pm.HalfNormal("beta_thick", sigma=0.5)
+        # sigma_base_vel   = pm.HalfNormal("sigma_base_vel", sigma=20.0)
+        # beta_vel         = pm.HalfNormal("beta_vel", sigma=0.5)
+        
+        ###PRIORS: the ones above were way too large lol, residual std was huge from the diagnostics at the end 
+        sigma_base_thick = pm.HalfNormal("sigma_base_thick", sigma=0.5)
+        sigma_base_vel   = pm.HalfNormal("sigma_base_vel", sigma=0.6)
+        
+        beta_thick = pm.HalfNormal("beta_thick", sigma=0.1)
+        beta_vel   = pm.HalfNormal("beta_vel", sigma=0.1)
 
         sigma_model_thick = sigma_base_thick * pm.math.sqrt(1.0 + beta_thick * speed[idx_thick])
         sigma_model_vel   = sigma_base_vel   * pm.math.sqrt(1.0 + beta_vel   * speed[idx_vel])
@@ -912,9 +1815,32 @@ def compute_model_weights(trace, data):
     w = w / w.sum()
 
     return w, loglik_scaled
+
+
+import pandas as pd
+
+def save_model_weights(weights, loglik):
+
+    model_ids = [f"run{i+1}" for i in range(len(weights))]
+
+    df = pd.DataFrame({
+        "model_id": model_ids,
+        "weight": weights,
+        "log_likelihood": loglik
+    })
+
+    df = df.sort_values("weight", ascending=False)
+
+    df.to_csv("model_weights_table.csv", index=False)
+
+    print("\nSaved model_weights_table.csv")
+
+    return df
 # ==============================================================================
 # MAIN
 # ==============================================================================
+
+
 
 def main():
     print("=" * 70)
@@ -1042,75 +1968,51 @@ def plot_pixel_coverage(raw):
         
         plt.show()
     
-        # ==========================================================
-        # VELOCITY COVERAGE BY YEAR
-        # ==========================================================
-    
-        valid_years = []
-    
-        for year in obs_vel_years:
-    
-            if year not in VX_obs:
-                continue
-    
-            # Check model availability
-            skip = False
-            for m in range(M):
-                if raw["vx_models"][m][year] is None:
-                    skip = True
-                    break
-    
-            if skip:
-                continue
-    
-            valid_years.append(year)
-    
-        if len(valid_years) == 0:
-            print("No valid velocity years")
+     # ==========================================================
+# VELOCITY CHANGE COVERAGE BY MODEL INTERVAL
+# ==========================================================
+
+        obs_dvxdt = raw["obs_dvxdt"]
+        obs_dvydt = raw["obs_dvydt"]
+        
+        times = obs_dvxdt.time.values
+        
+        if len(times) == 0:
+            print("No valid velocity change intervals")
             return
-    
-        n = len(valid_years)
-    
-        cols = min(4, n)
-        rows = int(np.ceil(n / cols))
-    
+        
+        cols = min(4, len(times))
+        rows = int(np.ceil(len(times) / cols))
+        
         fig, axes = plt.subplots(rows, cols, figsize=(4*cols,4*rows))
         axes = np.atleast_1d(axes).flatten()
-    
-        for i, year in enumerate(valid_years):
-    
-            vx = VX_obs[year]
-            vy = VY_obs[year]
-            vx_err = VX_ERR[year]
-            vy_err = VY_ERR[year]
-    
-            mask = (
-                np.isfinite(vx) &
-                np.isfinite(vy) &
-                np.isfinite(vx_err) &
-                np.isfinite(vy_err)
-            )
-    
+        
+        for i, t in enumerate(times):
+        
+            dvx = obs_dvxdt.sel(time=t).values
+            dvy = obs_dvydt.sel(time=t).values
+        
+            mask = np.isfinite(dvx) & np.isfinite(dvy)
+        
             ax = axes[i]
             im = ax.imshow(mask, origin="lower", cmap="viridis")
-    
-            ax.set_title(f"Velocity Pixels Used\n{year}")
+        
+            ax.set_title(f"Velocity Change Pixels Used\n{float(t):.1f}")
             ax.axis("off")
-    
+        
         for j in range(i+1, len(axes)):
             axes[j].axis("off")
-    
-        fig.colorbar(im, ax=axes.tolist(), shrink=0.7, label="Used Pixel (1=True)")
-    
-        plt.suptitle("Pixels Used for Velocity Likelihood")
-        plt.tight_layout()
-    
-        plt.savefig("pixel_coverage_velocity.png", dpi=300)
-    
-        print("✓ Saved pixel_coverage_velocity.png")
-    
-        plt.show()
         
+        fig.colorbar(im, ax=axes.tolist(), shrink=0.7, label="Used Pixel")
+        
+        plt.suptitle("Pixels Used for Velocity Change Likelihood")
+        plt.tight_layout()
+        
+        plt.savefig("pixel_coverage_velocity.png", dpi=300)
+        
+        print("✓ Saved pixel_coverage_velocity.png")
+        
+        plt.show()
 # ==============================================================================
 # FATAL PIXEL MAPS (LIKELIHOOD OUTLIERS FOR dh/dt)
 # ==============================================================================
@@ -1388,23 +2290,31 @@ def create_residual_maps(raw, weights):
     # =========================================================================
     
     # Get velocity years that were actually used
-    used_years = []
-    for year in raw["obs_vel_years"]:
-        # Check if this year was used (not None in models)
-        if all(raw["vx_models"][m][year] is not None for m in range(M)):
-            used_years.append(year)
+    # used_years = []
+    # for year in raw["obs_vel_years"]:
+    #     # Check if this year was used (not None in models)
+    #     if all(raw["vx_models"][m][year] is not None for m in range(M)):
+    #         used_years.append(year)
     
+    # if len(used_years) == 0:
+    #     print("\n⚠️  No velocity years available for residual maps")
+    #     return
+    
+    used_years = raw["obs_vel_years"]
+
     if len(used_years) == 0:
         print("\n⚠️  No velocity years available for residual maps")
         return
-    
+        
     print("\n" + "="*70)
     print("VELOCITY RESIDUAL STATISTICS (Time-Averaged)")
     print("="*70)
     
     # Compute time-averaged velocities
-    obs_vx_mean = np.nanmean(np.stack([raw["VX_obs"][y] for y in used_years]), axis=0)
-    obs_vy_mean = np.nanmean(np.stack([raw["VY_obs"][y] for y in used_years]), axis=0)
+    # obs_vx_mean = np.nanmean(np.stack([raw["VX_obs"][y] for y in used_years]), axis=0)
+    # obs_vy_mean = np.nanmean(np.stack([raw["VY_obs"][y] for y in used_years]), axis=0)
+    obs_vx_mean = raw["obs_dvxdt"].mean(dim="time", skipna=True).values
+    obs_vy_mean = raw["obs_dvydt"].mean(dim="time", skipna=True).values
     
     # Create figure: 2 rows (vx, vy) x M columns (models)
     fig, axes = plt.subplots(2, M, figsize=(6*M, 10), constrained_layout=True)
@@ -1412,12 +2322,16 @@ def create_residual_maps(raw, weights):
         axes = axes.reshape(2, 1)
     
     # Color normalization for velocity residuals
-    norm_vel = mcolors.TwoSlopeNorm(vcenter=0, vmin=-200, vmax=200)
+    norm_vel = mcolors.TwoSlopeNorm(vcenter=0, vmin=-5, vmax=5)
     
     for i in range(M):
         # Time-averaged model velocities
-        model_vx_mean = np.nanmean(np.stack([raw["vx_models"][i][y] for y in used_years]), axis=0)
-        model_vy_mean = np.nanmean(np.stack([raw["vy_models"][i][y] for y in used_years]), axis=0)
+        # model_vx_mean = np.nanmean(np.stack([raw["vx_models"][i][y] for y in used_years]), axis=0)
+        # model_vy_mean = np.nanmean(np.stack([raw["vy_models"][i][y] for y in used_years]), axis=0)
+        
+        model_vx_mean = raw["vx_models"][i].mean(dim="time", skipna=True).values
+        model_vy_mean = raw["vy_models"][i].mean(dim="time", skipna=True).values
+        
         
         # Residuals
         resid_vx = obs_vx_mean - model_vx_mean
@@ -1477,9 +2391,10 @@ def create_residual_maps(raw, weights):
     
     for i in range(M):
         # Time-averaged model velocities
-        model_vx_mean = np.nanmean(np.stack([raw["vx_models"][i][y] for y in used_years]), axis=0)
-        model_vy_mean = np.nanmean(np.stack([raw["vy_models"][i][y] for y in used_years]), axis=0)
-        
+        # model_vx_mean = np.nanmean(np.stack([raw["vx_models"][i][y] for y in used_years]), axis=0)
+        # model_vy_mean = np.nanmean(np.stack([raw["vy_models"][i][y] for y in used_years]), axis=0)
+        model_vx_mean = raw["vx_models"][i].mean(dim="time", skipna=True).values
+        model_vy_mean = raw["vy_models"][i].mean(dim="time", skipna=True).values
         # Model speed
         model_speed = np.sqrt(model_vx_mean**2 + model_vy_mean**2)
         
@@ -1526,8 +2441,11 @@ def create_residual_maps(raw, weights):
         rmse_dhdt = np.sqrt(np.nanmean(residual_dhdt**2))
         
         # Velocity
-        model_vx_mean = np.nanmean(np.stack([raw["vx_models"][i][y] for y in used_years]), axis=0)
-        model_vy_mean = np.nanmean(np.stack([raw["vy_models"][i][y] for y in used_years]), axis=0)
+        # model_vx_mean = np.nanmean(np.stack([raw["vx_models"][i][y] for y in used_years]), axis=0)
+        # model_vy_mean = np.nanmean(np.stack([raw["vy_models"][i][y] for y in used_years]), axis=0)
+        
+        model_vx_mean = raw["vx_models"][i].mean(dim="time", skipna=True).values
+        model_vy_mean = raw["vy_models"][i].mean(dim="time", skipna=True).values
         
         resid_vx = obs_vx_mean - model_vx_mean
         resid_vy = obs_vy_mean - model_vy_mean
@@ -1554,19 +2472,479 @@ def create_residual_maps(raw, weights):
 #     # trace, weights, data, raw = main()
     
 #     create_residual_maps(raw, weights)
+# if __name__ == "__main__":
+
+#     trace, weights, data, raw = main()
+
+#     create_residual_maps(raw, weights)
+
+#     plot_pixel_coverage(raw)
+
+#     create_fatal_pixel_maps(raw, trace)
+#     weights, loglik = compute_model_weights(trace, data)
+
+#     weights_table = save_model_weights(weights, loglik)
+
+
+#     for i in range(raw["M"]):
+#         make_dhdt_diagnostic_figure(raw, trace, model_index=i)
+
+
+#### calling the whole shabang 
+# if __name__ == "__main__":
+
+#     trace, weights, data, raw = main()
+
+#    # create_residual_maps(raw, weights)
+
+#     #plot_pixel_coverage(raw)
+
+#     create_fatal_pixel_maps(raw, trace)
+#     weights, loglik = compute_model_weights(trace, data)
+
+#     weights_table = save_model_weights(weights, loglik)
+###sanity check the model 
+def residual_calibration_check(trace, data):
+    """
+    Sanity check: verify standardized residuals follow N(0,1)
+
+    If uncertainty model is calibrated:
+        mean(z) ≈ 0
+        std(z) ≈ 1
+    """
+
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from scipy.stats import norm
+
+    print("\n======================================================================")
+    print("RESIDUAL CALIBRATION CHECK")
+    print("======================================================================")
+
+    # --------------------------------------------------
+    # Posterior mean parameters
+    # --------------------------------------------------
+
+    sigma_base_thick = trace.posterior["sigma_base_thick"].mean().values
+    beta_thick       = trace.posterior["beta_thick"].mean().values
+    sigma_base_vel   = trace.posterior["sigma_base_vel"].mean().values
+    beta_vel         = trace.posterior["beta_vel"].mean().values
+
+    print("Posterior parameters:")
+    print("sigma_base_thick =", sigma_base_thick)
+    print("beta_thick       =", beta_thick)
+    print("sigma_base_vel   =", sigma_base_vel)
+    print("beta_vel         =", beta_vel)
+
+    # --------------------------------------------------
+    # Data
+    # --------------------------------------------------
+
+    y       = data["y_obs"]
+    F       = data["F"]
+    speed   = data["speed"]
+    sig_obs = data["sigma_obs"]
+
+    n_thick = data["n_dhdt"]
+    n_vel   = data["n_vel"]
+
+    idx_thick = slice(0, n_thick)
+    idx_vel   = slice(n_thick, n_thick+n_vel)
+
+    # --------------------------------------------------
+    # Rebuild model uncertainty (MATCHES YOUR MODEL)
+    # --------------------------------------------------
+
+    sigma_model_thick = sigma_base_thick * np.sqrt(1 + beta_thick * speed[idx_thick])
+    sigma_model_vel   = sigma_base_vel   * np.sqrt(1 + beta_vel   * speed[idx_vel])
+
+    sigma_tot_thick = np.sqrt(sig_obs[idx_thick]**2 + sigma_model_thick**2)
+    sigma_tot_vel   = np.sqrt(sig_obs[idx_vel]**2   + sigma_model_vel**2)
+
+    # --------------------------------------------------
+    # Best model (highest weight)
+    # --------------------------------------------------
+
+    weights = trace.posterior["w"].mean(("chain","draw")).values
+    best_model = np.argmax(weights)
+
+    print("\nUsing best model:", best_model+1)
+
+    residuals = y - F[best_model]
+
+    # --------------------------------------------------
+    # Standardized residuals
+    # --------------------------------------------------
+
+    z_thick = residuals[idx_thick] / sigma_tot_thick
+    z_vel   = residuals[idx_vel]   / sigma_tot_vel
+
+    z = np.concatenate([z_thick, z_vel])
+    z = z[np.isfinite(z)]
+
+    print("\nResidual statistics")
+    print("mean =", np.mean(z))
+    print("std  =", np.std(z))
+
+    # --------------------------------------------------
+    # Plot histogram
+    # --------------------------------------------------
+
+    plt.figure(figsize=(6,5))
+
+    plt.hist(z, bins=80, density=True, alpha=0.7, label="Standardized residuals")
+
+    x = np.linspace(-5,5,500)
+    plt.plot(x, norm.pdf(x,0,1), 'r', lw=2, label="Normal(0,1)")
+
+    plt.xlabel("z-score")
+    plt.ylabel("Density")
+    plt.title("Residual Calibration Check")
+    plt.legend()
+
+    plt.tight_layout()
+    plt.savefig("residual_calibration.png", dpi=300)
+
+    print("✓ Saved residual_calibration.png")
+
+    plt.show()
+    
+# ==============================================================================
+# SPATIAL AUTOCORRELATION TEST (Correlation Length + Effective Sample Size)
+# ==============================================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import fftconvolve
+
+
+def estimate_spatial_correlation_length(field, grid_km=5, plot=True):
+    """
+    Estimate spatial correlation length scale from a 2D field.
+
+    Parameters
+    ----------
+    field : 2D array
+        residual field (obs - model)
+
+    grid_km : float
+        grid spacing in km
+
+    plot : bool
+        show correlation decay plot
+
+    Returns
+    -------
+    L : float
+        estimated correlation length (km)
+    """
+
+    field = field.copy()
+
+    # --------------------------------------------------
+    # Remove NaNs
+    # --------------------------------------------------
+
+    mask = np.isfinite(field)
+
+    if np.sum(mask) < 100:
+        raise ValueError("Too few valid pixels to estimate correlation")
+
+    field = field - np.nanmean(field)
+
+    field[~mask] = 0
+
+    # --------------------------------------------------
+    # 2D autocorrelation using FFT
+    # --------------------------------------------------
+
+    corr = fftconvolve(field, field[::-1, ::-1], mode="same")
+
+    corr /= np.nanmax(corr)
+
+    # --------------------------------------------------
+    # radial averaging
+    # --------------------------------------------------
+
+    y, x = np.indices(corr.shape)
+
+    center = np.array(corr.shape) // 2
+
+    r = np.sqrt((x-center[1])**2 + (y-center[0])**2)
+
+    r = r.astype(int)
+
+    tbin = np.bincount(r.ravel(), corr.ravel())
+    nr = np.bincount(r.ravel())
+
+    radial_corr = tbin / nr
+
+    distance = np.arange(len(radial_corr)) * grid_km
+
+    # --------------------------------------------------
+    # find correlation length (1/e decay)
+    # --------------------------------------------------
+
+    idx = np.where(radial_corr < 1/np.e)[0]
+
+    if len(idx) == 0:
+        L = np.nan
+    else:
+        L = distance[idx[0]]
+
+    # --------------------------------------------------
+    # plot
+    # --------------------------------------------------
+
+    if plot:
+
+        plt.figure(figsize=(6,4))
+
+        plt.plot(distance, radial_corr)
+
+        plt.axhline(1/np.e, linestyle="--", color="red", label="1/e threshold")
+        plt.axvline(L, linestyle="--", color="black", label=f"L ≈ {L:.1f} km")
+
+        plt.xlabel("Distance (km)")
+        plt.ylabel("Correlation")
+
+        plt.title("Spatial Correlation Length")
+
+        plt.legend()
+
+        plt.tight_layout()
+
+        plt.show()
+
+    return L
+
+
+def effective_sample_size(field, L, grid_km=5):
+    """
+    Estimate effective number of independent pixels.
+    """
+
+    ny, nx = field.shape
+
+    area = nx * ny * grid_km**2
+
+    Neff = area / (np.pi * L**2)
+
+    return int(Neff)
+
+
+def spatial_autocorrelation_diagnostic(raw, grid_km=8):
+
+    """
+    Run spatial autocorrelation diagnostics for all models using dh/dt residuals.
+    Computes:
+        - Correlation length (L)
+        - Lag-1 spatial correlation
+        - Integrated autocorrelation strength
+        - Effective sample size
+    """
+
+    import numpy as np
+    from scipy.signal import fftconvolve
+
+    print("\n" + "="*70)
+    print("SPATIAL AUTOCORRELATION DIAGNOSTIC")
+    print("="*70)
+
+    obs = raw["obs_dhdt"].mean(dim="time", skipna=True).values
+
+    M = raw["M"]
+
+    results = []
+
+    for i in range(M):
+
+        model = raw["ensemble_dhdt"][i].mean(dim="time", skipna=True).values
+
+        residual = obs - model
+
+        print(f"\nModel {i+1}")
+
+        # --------------------------------------------------
+        # Remove NaNs
+        # --------------------------------------------------
+
+        field = residual.copy()
+        mask = np.isfinite(field)
+
+        field = field - np.nanmean(field)
+        field[~mask] = 0
+
+        # --------------------------------------------------
+        # 2D autocorrelation (FFT)
+        # --------------------------------------------------
+
+        corr = fftconvolve(field, field[::-1, ::-1], mode="same")
+        corr /= np.nanmax(corr)
+
+        # --------------------------------------------------
+        # radial averaging
+        # --------------------------------------------------
+
+        y, x = np.indices(corr.shape)
+
+        center = np.array(corr.shape) // 2
+
+        r = np.sqrt((x-center[1])**2 + (y-center[0])**2)
+        r = r.astype(int)
+
+        tbin = np.bincount(r.ravel(), corr.ravel())
+        nr = np.bincount(r.ravel())
+
+        radial_corr = tbin / nr
+
+        distance = np.arange(len(radial_corr)) * grid_km
+
+        # --------------------------------------------------
+        # correlation length (1/e crossing)
+        # --------------------------------------------------
+
+        idx = np.where(radial_corr < 1/np.e)[0]
+
+        if len(idx) > 0:
+            L = distance[idx[0]]
+        else:
+            L = np.nan
+
+        # --------------------------------------------------
+        # SAC strength metrics
+        # --------------------------------------------------
+
+        lag1_corr = radial_corr[1]
+
+        integrated_corr = np.trapz(radial_corr, distance)
+
+        # --------------------------------------------------
+        # effective sample size
+        # --------------------------------------------------
+
+        ny, nx = residual.shape
+
+        area = nx * ny * grid_km**2
+
+        Neff = int(area / (np.pi * L**2)) if np.isfinite(L) else np.nan
+
+        Npix = np.sum(np.isfinite(residual))
+
+        # --------------------------------------------------
+        # print results
+        # --------------------------------------------------
+
+        print(f"Correlation length:       {L:.1f} km")
+        print(f"Lag-1 correlation:       {lag1_corr:.3f}")
+        print(f"Integrated correlation:  {integrated_corr:.1f} km")
+        print(f"Total pixels:            {Npix:,}")
+        print(f"Effective samples:       {Neff:,}")
+
+        results.append((L, lag1_corr, integrated_corr, Neff))
+
+    print("\n" + "="*70)
+
+    
+    return results
+
+def plot_pixels_used_after_uncertainty_filter(raw):
+    """
+    Simple diagnostic plot showing which pixels remain after applying
+    uncertainty thresholds used in flatten_and_mask_combined().
+
+    Shows:
+        1) Thickness pixels used
+        2) Velocity change pixels used
+    """
+
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    THICK_UNC_THRESHOLD = 50.0
+    VEL_UNC_THRESHOLD = 10.0
+
+    print("\nPlotting pixels used after uncertainty filtering...")
+
+    # ==========================================================
+    # THICKNESS
+    # ==========================================================
+
+    obs = raw["obs_dhdt"].mean(dim="time", skipna=True).values
+    unc = raw["obs_unc"].mean(dim="time", skipna=True).values
+
+    mask_thick = (
+        np.isfinite(obs)
+        & np.isfinite(unc)
+        & (unc < THICK_UNC_THRESHOLD)
+    )
+
+    fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+
+    im0 = ax[0].imshow(mask_thick, origin="lower", cmap="viridis")
+    ax[0].set_title("Thickness Pixels Used\n(after uncertainty filter)")
+    ax[0].axis("off")
+
+    plt.colorbar(im0, ax=ax[0], label="1 = used")
+
+    print(f"Thickness pixels used: {np.sum(mask_thick):,}")
+
+    # ==========================================================
+    # VELOCITY
+    # ==========================================================
+
+    dvx = raw["obs_dvxdt"].mean(dim="time", skipna=True).values
+    dvy = raw["obs_dvydt"].mean(dim="time", skipna=True).values
+
+    uncx = raw["obs_uncx"].mean(dim="time", skipna=True).values
+    uncy = raw["obs_uncy"].mean(dim="time", skipna=True).values
+
+    mask_vel = (
+        np.isfinite(dvx)
+        & np.isfinite(dvy)
+        & np.isfinite(uncx)
+        & np.isfinite(uncy)
+        & (uncx < VEL_UNC_THRESHOLD)
+        & (uncy < VEL_UNC_THRESHOLD)
+    )
+
+    im1 = ax[1].imshow(mask_vel, origin="lower", cmap="viridis")
+    ax[1].set_title("Velocity Pixels Used\n(after uncertainty filter)")
+    ax[1].axis("off")
+
+    plt.colorbar(im1, ax=ax[1], label="1 = used")
+
+    print(f"Velocity pixels used: {np.sum(mask_vel):,}")
+
+    plt.tight_layout()
+
+    plt.savefig("pixels_used_after_uncertainty_filter.png", dpi=300)
+
+    print("✓ Saved pixels_used_after_uncertainty_filter.png")
+
+    plt.show()
+
 if __name__ == "__main__":
 
     trace, weights, data, raw = main()
 
-    create_residual_maps(raw, weights)
-
-    plot_pixel_coverage(raw)
-
     create_fatal_pixel_maps(raw, trace)
 
+    weights, loglik = compute_model_weights(trace, data)
 
-    for i in range(raw["M"]):
-        make_dhdt_diagnostic_figure(raw, trace, model_index=i)
+    weights_table = save_model_weights(weights, loglik)
+
+    # --------------------------------------------------
+    # Sanity check
+    # --------------------------------------------------
+
+    residual_calibration_check(trace, data)
+    spatial_autocorrelation_diagnostic(raw, grid_km=8)
+    plot_pixels_used_after_uncertainty_filter(raw)
+
+
+    # for i in range(raw["M"]):
+    #     make_dhdt_diagnostic_figure(raw, trace, model_index=i)
     
     
-#fatal pixels
+
